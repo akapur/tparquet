@@ -25,6 +25,10 @@ pub struct WriterOptions {
     /// always `PLAIN`); under `Policy::Auto`, PCODEC is compared with the base codec in this
     /// encoding.
     pub encodings: Vec<(String, Encoding)>,
+    /// Per-column dictionary settings of the base columns, named as `columns` names them (the
+    /// longest name that covers a leaf wins): they override the dictionary setting of
+    /// `properties`. PCODEC columns and columns with an encoding have no dictionary.
+    pub dictionaries: Vec<(String, bool)>,
     /// pcodec compression level of the PCODEC columns.
     pub level: PcodecLevel,
     /// Codec of every other column.
@@ -63,6 +67,7 @@ impl Default for WriterOptions {
             policy: Policy::Auto,
             columns: vec![],
             encodings: vec![],
+            dictionaries: vec![],
             level: PcodecLevel::default(),
             base: default_base(),
             properties: WriterProperties::default(),
@@ -86,6 +91,12 @@ impl WriterOptions {
     /// Sets the encoding of the column `name` when it gets the base codec.
     pub fn with_encoding(mut self, name: impl Into<String>, encoding: Encoding) -> Self {
         self.encodings.push((name.into(), encoding));
+        self
+    }
+
+    /// Enables or disables the dictionary of the column `name` when it gets the base codec.
+    pub fn with_dictionary(mut self, name: impl Into<String>, enabled: bool) -> Self {
+        self.dictionaries.push((name.into(), enabled));
         self
     }
 
@@ -114,6 +125,8 @@ struct Leaf {
     path: ColumnPath,
     /// The encoding of the column when it gets the base codec, when one is set.
     encoding: Option<Encoding>,
+    /// Whether the column has a dictionary when it gets the base codec, when one is set.
+    dictionary: Option<bool>,
     /// `None` when the column is not eligible for PCODEC.
     policy: Option<Policy>,
 }
@@ -148,6 +161,11 @@ pub struct Writer<W: Write + Send> {
     state: State<W>,
 }
 
+/// The value of the longest name in `named` that covers `path`.
+fn longest<T: Copy>(named: &[(String, T)], path: &ColumnPath) -> Option<T> {
+    named.iter().filter(|(name, _)| covers(name, path.parts())).max_by_key(|(name, _)| name.len()).map(|&(_, v)| v)
+}
+
 fn eligible(t: Type) -> bool {
     matches!(t, Type::INT32 | Type::INT64 | Type::FLOAT | Type::DOUBLE)
 }
@@ -162,17 +180,18 @@ impl<W: Write + Send> Writer<W> {
             .iter()
             .map(|c| Leaf {
                 path: c.path().clone(),
-                encoding: options
-                    .encodings
-                    .iter()
-                    .filter(|(name, _)| covers(name, c.path().parts()))
-                    .max_by_key(|(name, _)| name.len())
-                    .map(|&(_, e)| e),
+                encoding: longest(&options.encodings, c.path()),
+                dictionary: longest(&options.dictionaries, c.path()),
                 policy: eligible(c.physical_type())
                     .then(|| resolve(c.path().parts(), &options.columns, options.policy)),
             })
             .collect();
-        let names = options.columns.iter().map(|(name, _)| name).chain(options.encodings.iter().map(|(name, _)| name));
+        let names = options
+            .columns
+            .iter()
+            .map(|(name, _)| name)
+            .chain(options.encodings.iter().map(|(name, _)| name))
+            .chain(options.dictionaries.iter().map(|(name, _)| name));
         if let Some(name) = names.into_iter().find(|name| !leaves.iter().any(|l| covers(name, l.path.parts()))) {
             return Err(invalid(format!("no column named {name:?}")));
         }
@@ -181,6 +200,12 @@ impl<W: Write + Send> Writer<W> {
             options.encodings.iter().find(|(_, e)| matches!(e, Encoding::PLAIN_DICTIONARY | Encoding::RLE_DICTIONARY))
         {
             return Err(invalid(format!("{e} is a dictionary encoding: the dictionary is the writer's default")));
+        }
+        if let Some(leaf) = leaves.iter().find(|l| l.encoding.is_some() && l.dictionary == Some(true)) {
+            return Err(invalid(format!(
+                "the column {} has an encoding: it is written without a dictionary",
+                leaf.path.string()
+            )));
         }
         let mut writer =
             Self { schema, options, pcodec: vec![false; leaves.len()], leaves, chosen: None, state: State::Failed };
@@ -197,6 +222,9 @@ impl<W: Write + Send> Writer<W> {
     /// when any is (or when `v2`).
     fn properties(&self, pcodec: &[bool], v2: bool) -> WriterProperties {
         let mut b = self.options.properties.clone().into_builder().set_compression(self.options.base);
+        for (leaf, d) in self.leaves.iter().filter_map(|l| l.dictionary.map(|d| (l, d))) {
+            b = b.set_column_dictionary_enabled(leaf.path.clone(), d);
+        }
         for (leaf, e) in self.leaves.iter().filter_map(|l| l.encoding.map(|e| (l, e))) {
             b = b.set_column_encoding(leaf.path.clone(), e).set_column_dictionary_enabled(leaf.path.clone(), false);
         }

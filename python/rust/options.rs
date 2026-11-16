@@ -4,7 +4,7 @@ use crate::errors::{from_pcodec, invalid};
 use pyo3::prelude::*;
 use std::collections::BTreeMap;
 use tparquet::parquet::basic::Compression;
-use tparquet::parquet::file::properties::WriterProperties;
+use tparquet::parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tparquet::{ColumnCodec, Policy, WriterOptions};
 
 /// The keyword arguments `write_table`, `Writer` and `transcode` share.
@@ -17,6 +17,33 @@ pub struct Options {
     pub base: String,
     pub row_group_size: Option<i64>,
     pub encodings: BTreeMap<String, String>,
+    pub data_page_size: Option<i64>,
+    pub data_page_row_count_limit: Option<i64>,
+    pub write_batch_size: Option<i64>,
+    pub dictionary: Option<bool>,
+    /// Columns with a dictionary, which every other column then lacks.
+    pub dictionary_columns: Vec<String>,
+    pub statistics: Option<String>,
+}
+
+fn positive(name: &str, value: Option<i64>) -> PyResult<Option<usize>> {
+    value
+        .map(|n| {
+            usize::try_from(n)
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| invalid(format!("{name} must be positive, got {n}")))
+        })
+        .transpose()
+}
+
+fn statistics(s: &str) -> PyResult<EnabledStatistics> {
+    match s {
+        "none" => Ok(EnabledStatistics::None),
+        "chunk" => Ok(EnabledStatistics::Chunk),
+        "page" => Ok(EnabledStatistics::Page),
+        _ => Err(invalid(format!("unknown statistics level {s:?}: expected \"none\", \"chunk\" or \"page\""))),
+    }
 }
 
 /// Parses a base codec such as `zstd(3)` or `snappy` (`tparquet::parse_base`).
@@ -31,6 +58,9 @@ impl Options {
         for (name, p) in &self.columns {
             o = o.with_column(name.clone(), p.parse().map_err(from_pcodec)?);
         }
+        for name in &self.dictionary_columns {
+            o = o.with_dictionary(name.clone(), true);
+        }
         for (name, e) in &self.encodings {
             let encoding = e.parse().map_err(|e: tparquet::parquet::errors::ParquetError| invalid(e.to_string()))?;
             o = o.with_encoding(name.clone(), encoding);
@@ -38,13 +68,26 @@ impl Options {
         let bad_level = || invalid(format!("level {} is not in 0..=12", self.level));
         let level = u32::try_from(self.level).map_err(|_| bad_level())?;
         o = o.with_level(level).map_err(|_| bad_level())?;
-        if let Some(n) = self.row_group_size {
-            let n = usize::try_from(n)
-                .ok()
-                .filter(|n| *n > 0)
-                .ok_or_else(|| invalid(format!("row_group_size must be positive, got {n}")))?;
-            o.properties = WriterProperties::builder().set_max_row_group_row_count(Some(n)).build();
+        let mut b = WriterProperties::builder();
+        if let Some(n) = positive("row_group_size", self.row_group_size)? {
+            b = b.set_max_row_group_row_count(Some(n));
         }
+        if let Some(n) = positive("data_page_size", self.data_page_size)? {
+            b = b.set_data_page_size_limit(n);
+        }
+        if let Some(n) = positive("data_page_row_count_limit", self.data_page_row_count_limit)? {
+            b = b.set_data_page_row_count_limit(n);
+        }
+        if let Some(n) = positive("write_batch_size", self.write_batch_size)? {
+            b = b.set_write_batch_size(n);
+        }
+        if let Some(d) = self.dictionary {
+            b = b.set_dictionary_enabled(d);
+        }
+        if let Some(s) = &self.statistics {
+            b = b.set_statistics_enabled(statistics(s)?);
+        }
+        o.properties = b.build();
         Ok(o)
     }
 }
