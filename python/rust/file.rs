@@ -3,20 +3,27 @@
 use crate::errors::{detached, from_arrow, from_parquet, from_pcodec, invalid, os_error};
 use crate::ffi::{ArrowSchema, RecordBatchStream, named};
 use crate::options::codec_name;
+use arrow_array::cast::AsArray;
+use arrow_array::types::{
+    ArrowDictionaryKeyType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+};
+use arrow_array::{Array, ArrayRef, DictionaryArray, RecordBatchOptions};
 use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
 use arrow_schema::{ArrowError, DataType, SchemaRef, TimeUnit};
+use arrow_select::concat::concat;
 use bytes::Bytes;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyDict;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tparquet::parquet::DecodeResult;
 use tparquet::parquet::arrow::ProjectionMask;
-use tparquet::parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder,
-};
+use tparquet::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use tparquet::parquet::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder};
 use tparquet::parquet::errors::{ParquetError, Result as ParquetResult};
 use tparquet::parquet::file::reader::{ChunkReader, Length};
 use tparquet::parquet::file::statistics::Statistics;
@@ -84,18 +91,72 @@ impl ChunkReader for Reader {
 
     fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
         match self {
-            Self::File { .. } => {
-                // read as the bytes arrive: a length from a corrupt footer allocates no more
+            Self::File { file, len } => {
+                // checked before allocating: a length from a corrupt footer allocates no more
                 // than the file holds
-                let mut buf = Vec::new();
-                self.get_read(start)?.take(length as u64).read_to_end(&mut buf)?;
-                if buf.len() != length {
+                if start.checked_add(length as u64).is_none_or(|end| end > *len) {
                     return Err(ParquetError::EOF(format!("{length} bytes at {start} are past the end of the file")));
                 }
+                let mut buf = vec![0; length];
+                read_exact_at(file, &mut buf, start)?;
                 Ok(buf.into())
             }
             Self::Bytes(b) => b.get_bytes(start, length),
         }
+    }
+}
+
+fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match read_at(file, buf, offset) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Ranges this close together are read as one: reading the gap costs less than another seek on
+/// a disk, and than another read of a record that a file system does not cache.
+const MAX_GAP: u64 = 1 << 20;
+
+impl Reader {
+    /// The bytes of each of `ranges`, with one read per run of ranges at most [`MAX_GAP`] apart.
+    fn fetch(&self, ranges: &[Range<u64>]) -> ParquetResult<Vec<Bytes>> {
+        if let Some(r) = ranges.iter().find(|r| r.end < r.start) {
+            return Err(ParquetError::General(format!("byte range {r:?} ends before it starts")));
+        }
+        let mut order: Vec<usize> = (0..ranges.len()).collect();
+        order.sort_unstable_by_key(|&i| ranges[i].start);
+        let mut out = vec![Bytes::new(); ranges.len()];
+        let mut run = order.as_slice();
+        while let Some(&first) = run.first() {
+            let start = ranges[first].start;
+            let mut end = ranges[first].end;
+            let n = run
+                .iter()
+                .take_while(|&&i| {
+                    let joins = ranges[i].start <= end.saturating_add(MAX_GAP);
+                    if joins {
+                        end = end.max(ranges[i].end);
+                    }
+                    joins
+                })
+                .count();
+            let length =
+                usize::try_from(end - start).map_err(|_| ParquetError::EOF(format!("range {start}..{end}")))?;
+            let data = self.get_bytes(start, length)?;
+            for &i in &run[..n] {
+                out[i] = data.slice((ranges[i].start - start) as usize..(ranges[i].end - start) as usize);
+            }
+            run = &run[n..];
+        }
+        Ok(out)
     }
 }
 
@@ -178,10 +239,131 @@ pub fn open_bytes(py: Python<'_>, data: PyBackedBytes) -> PyResult<File> {
     File::load(py, || Ok(Source::Bytes(Bytes::from_owner(data))))
 }
 
+/// The batches of a push decoder, fed by `reader` with the byte ranges it asks for: whole
+/// column chunks, rather than each page as the page reader reaches it. The decoder ends a batch
+/// at each row group; these batches run across row groups, `batch_size` rows each but the last.
+struct Decoded {
+    decoder: ParquetPushDecoder,
+    reader: Reader,
+    batch_size: usize,
+    pending: VecDeque<RecordBatch>,
+    pending_rows: usize,
+    failed: bool,
+}
+
+impl Decoded {
+    fn new(decoder: ParquetPushDecoder, reader: Reader, batch_size: usize) -> Self {
+        Self { decoder, reader, batch_size, pending: VecDeque::new(), pending_rows: 0, failed: false }
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ArrowError> {
+        while self.pending_rows < self.batch_size {
+            match self.next_decoded()? {
+                Some(batch) if self.pending.is_empty() && batch.num_rows() == self.batch_size => {
+                    return Ok(Some(batch));
+                }
+                Some(batch) => {
+                    self.pending_rows += batch.num_rows();
+                    self.pending.push_back(batch);
+                }
+                None if self.pending.is_empty() => return Ok(None),
+                None => break,
+            }
+        }
+        self.take_pending(self.batch_size.min(self.pending_rows)).map(Some)
+    }
+
+    fn take_pending(&mut self, rows: usize) -> Result<RecordBatch, ArrowError> {
+        let mut parts = Vec::new();
+        let mut needed = rows;
+        while needed > 0 {
+            let Some(front) = self.pending.pop_front() else { break };
+            if front.num_rows() > needed {
+                parts.push(front.slice(0, needed));
+                self.pending.push_front(front.slice(needed, front.num_rows() - needed));
+                needed = 0;
+            } else {
+                needed -= front.num_rows();
+                parts.push(front);
+            }
+        }
+        self.pending_rows -= rows;
+        match parts.as_slice() {
+            [one] => Ok(one.clone()),
+            _ => concat_parts(&parts, rows),
+        }
+    }
+
+    fn next_decoded(&mut self) -> ParquetResult<Option<RecordBatch>> {
+        loop {
+            match self.decoder.try_decode()? {
+                DecodeResult::Data(batch) => return Ok(Some(batch)),
+                DecodeResult::Finished => return Ok(None),
+                DecodeResult::NeedsData(ranges) => {
+                    let data = self.reader.fetch(&ranges)?;
+                    self.decoder.push_ranges(ranges, data)?;
+                }
+            }
+        }
+    }
+}
+
+impl Iterator for Decoded {
+    type Item = Result<RecordBatch, ArrowError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        let batch = self.next_batch().transpose()?;
+        self.failed = batch.is_err();
+        Some(batch)
+    }
+}
+
+/// `parts` as one batch. Row groups have dictionaries of their own, usually equal: a dictionary
+/// column keeps one of them when they are, as the page reader's batches do.
+fn concat_parts(parts: &[RecordBatch], rows: usize) -> Result<RecordBatch, ArrowError> {
+    let schema = parts[0].schema();
+    let columns = (0..schema.fields().len())
+        .map(|c| {
+            let arrays: Vec<&dyn Array> = parts.iter().map(|p| p.column(c).as_ref()).collect();
+            let shared = match arrays[0].data_type() {
+                DataType::Dictionary(key, _) => match key.as_ref() {
+                    DataType::Int8 => concat_keys::<Int8Type>(&arrays)?,
+                    DataType::Int16 => concat_keys::<Int16Type>(&arrays)?,
+                    DataType::Int32 => concat_keys::<Int32Type>(&arrays)?,
+                    DataType::Int64 => concat_keys::<Int64Type>(&arrays)?,
+                    DataType::UInt8 => concat_keys::<UInt8Type>(&arrays)?,
+                    DataType::UInt16 => concat_keys::<UInt16Type>(&arrays)?,
+                    DataType::UInt32 => concat_keys::<UInt32Type>(&arrays)?,
+                    DataType::UInt64 => concat_keys::<UInt64Type>(&arrays)?,
+                    _ => None,
+                },
+                _ => None,
+            };
+            shared.map_or_else(|| concat(&arrays), Ok)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    RecordBatch::try_new_with_options(schema, columns, &RecordBatchOptions::new().with_row_count(Some(rows)))
+}
+
+/// The dictionary arrays `arrays` as one, if they share their dictionary's values.
+fn concat_keys<K: ArrowDictionaryKeyType>(arrays: &[&dyn Array]) -> Result<Option<ArrayRef>, ArrowError> {
+    let dictionaries: Vec<&DictionaryArray<K>> = arrays.iter().map(|a| a.as_dictionary::<K>()).collect();
+    let values = dictionaries[0].values();
+    if dictionaries[1..].iter().any(|d| d.values().to_data() != values.to_data()) {
+        return Ok(None);
+    }
+    let keys: Vec<&dyn Array> = dictionaries.iter().map(|d| d.keys() as &dyn Array).collect();
+    let keys = concat(&keys)?.as_primitive::<K>().clone();
+    Ok(Some(Arc::new(DictionaryArray::<K>::try_new(keys, values.clone())?)))
+}
+
 /// Batches of a projected reader with the columns in the requested order; its errors name
 /// the file when it has a name.
 struct Reordered {
-    inner: ParquetRecordBatchReader,
+    inner: Decoded,
     order: Vec<usize>,
     schema: SchemaRef,
     name: Option<String>,
@@ -239,8 +421,8 @@ impl File {
             .ok()
             .filter(|n| *n > 0)
             .ok_or_else(|| invalid(format!("batch_size must be positive, got {batch_size}")))?;
-        let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(self.reader(), self.metadata.clone())
-            .with_batch_size(batch_size);
+        let mut builder =
+            ParquetPushDecoderBuilder::new_with_metadata(self.metadata.clone()).with_batch_size(batch_size);
         if let Some(rgs) = row_groups {
             let n = self.metadata.metadata().num_row_groups();
             let rgs = rgs
@@ -261,7 +443,8 @@ impl File {
         }
         let (sorted, order, schema) = self.projection(columns)?;
         let mask = ProjectionMask::roots(self.metadata.parquet_schema(), sorted);
-        let inner = builder.with_projection(mask).build().map_err(from_parquet)?;
+        let decoder = builder.with_projection(mask).build().map_err(from_parquet)?;
+        let inner = Decoded::new(decoder, self.reader(), batch_size);
         let name = self.source.name();
         Ok(RecordBatchStream::new(Box::new(Reordered { inner, order, schema, name })))
     }

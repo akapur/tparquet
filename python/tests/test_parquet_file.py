@@ -197,6 +197,32 @@ def test_files_are_closed_when_dropped(path: pathlib.Path) -> None:
     assert fds() == before
 
 
+def io_counters() -> tuple[int, int]:
+    """Read syscalls and bytes read by this process so far."""
+    with open("/proc/self/io") as f:
+        fields = dict(line.split(": ") for line in f.read().splitlines())
+    return int(fields["syscr"]), int(fields["rchar"])
+
+
+# Many small pages (20,000 rows each at most), in two row groups of four column chunks.
+MANY_PAGES = pa.table({c: pa.array(range(i, i + 200_000), pa.int64()) for i, c in enumerate("abcd")})
+
+
+@pytest.mark.skipif(not os.path.isfile("/proc/self/io"), reason="needs /proc/self/io")
+@pytest.mark.parametrize("columns", [None, ["b", "d"]])
+def test_a_column_chunk_is_read_at_once(tmp_path: pathlib.Path, columns: list[str] | None) -> None:
+    path = tmp_path / "pages.parquet"
+    ppc.write_table(MANY_PAGES, path, policy="pcodec", row_group_size=100_000)
+    f = ppc.ParquetFile(path)
+    names = columns or MANY_PAGES.column_names
+    calls, read = io_counters()
+    table = rows(f.stream(columns=columns))
+    calls_after, read_after = io_counters()
+    assert table.equals(MANY_PAGES.select(names))
+    assert calls_after - calls <= f.metadata.num_row_groups * len(names)
+    assert read_after - read <= path.stat().st_size
+
+
 def rss() -> int:
     with open("/proc/self/statm") as f:
         return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")

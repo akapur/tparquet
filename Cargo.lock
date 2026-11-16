@@ -3296,6 +3296,7 @@ dependencies = [
  "arrow-array",
  "arrow-data",
  "arrow-schema",
+ "arrow-select",
  "bytes",
  "pyo3",
  "tparquet",
