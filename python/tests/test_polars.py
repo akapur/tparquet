@@ -283,6 +283,8 @@ SCHEMA = pl.Schema(
         "utc": pl.Datetime("ms", "UTC"),
         "f": pl.Float64(),
         "u": pl.UInt32(),
+        "s": pl.String(),
+        "c": pl.Categorical(),
     }
 )
 
@@ -328,6 +330,16 @@ def binary(left: object, op: str, right: object) -> dict[str, Any]:
         (scalar("Datetime", [9, "Milliseconds", None]), pl.Datetime("ms", "UTC"), None),
         (scalar("Datetime", [9, "Milliseconds", None]), pl.Date(), None),
         (scalar("Datetime", 9), pl.Datetime("ms"), None),
+        (scalar("String", "AAPL"), pl.String(), "AAPL"),
+        (scalar("String", "AAPL"), pl.Categorical(), "AAPL"),
+        (scalar("String", "AAPL"), pl.Int64(), None),
+        (scalar("String", 5), pl.String(), None),
+        (scalar("Int64", 5), pl.String(), None),
+        (dyn(5), pl.String(), None),
+        (scalar("Categorical", {"value": "S1", "name": ""}), pl.Categorical(), "S1"),
+        (scalar("Categorical", {"value": "S1"}), pl.String(), None),
+        (scalar("Categorical", {"value": 1}), pl.Categorical(), None),
+        (scalar("Categorical", "S1"), pl.Categorical(), None),
         ({"Literal": {"Scalar": {"Int8": 1, "Int16": 2}}}, pl.Int64(), None),
         ({"Literal": {"Scalar": 5}}, pl.Int64(), None),
         ({"Literal": 5}, pl.Int64(), None),
@@ -336,11 +348,11 @@ def binary(left: object, op: str, right: object) -> dict[str, Any]:
     ],
     ids=str,
 )
-def test_literals(node: object, dtype: pl.DataType, value: int | None) -> None:
+def test_literals(node: object, dtype: pl.DataType, value: int | str | None) -> None:
     assert ppl._literal(node, dtype) == value
 
 
-BOUNDS = {"i": (10, 20), "d": (100, 100)}
+BOUNDS: ppl.Bounds = {"i": (10, 20), "d": (100, 100), "s": ("B", "Bz"), "c": ("B", "Bz")}
 
 
 @pytest.mark.parametrize(
@@ -374,6 +386,21 @@ BOUNDS = {"i": (10, 20), "d": (100, 100)}
         (binary(binary(col("i"), "Lt", dyn(5)), "LogicalOr", binary(col("i"), "Gt", dyn(30))), False),
         (binary(col("d"), "Eq", scalar("Date", 100)), True),
         (binary(col("d"), "Gt", scalar("Date", 100)), False),
+        (binary(col("s"), "Eq", scalar("String", "B")), True),
+        (binary(col("s"), "Eq", scalar("String", "Bz")), True),
+        (binary(col("s"), "Eq", scalar("String", "Ba")), True),
+        (binary(col("s"), "Eq", scalar("String", "A")), False),
+        (binary(col("s"), "Eq", scalar("String", "C")), False),
+        # code-point order is UTF-8 byte order: "B\xe9" sorts after "Bz"
+        (binary(col("s"), "Eq", scalar("String", "B\xe9")), False),
+        (binary(col("s"), "Lt", scalar("String", "B")), False),
+        (binary(col("s"), "GtEq", scalar("String", "Bz")), True),
+        (binary(col("s"), "Gt", scalar("String", "Bz")), False),
+        (binary(scalar("String", "Ba"), "Gt", col("s")), True),
+        (binary(scalar("String", "B"), "Gt", col("s")), False),
+        (binary(col("c"), "Eq", scalar("String", "A")), False),
+        (binary(col("c"), "Eq", scalar("Categorical", {"value": "Ba"})), True),
+        (binary(scalar("String", "C"), "Eq", col("c")), False),
         # a column without bounds is kept
         (binary(col("us"), "Lt", scalar("Datetime", [0, "Microseconds", None])), True),
         (binary(col("utc"), "Lt", scalar("Datetime", [0, "Milliseconds", "UTC"])), True),
@@ -428,6 +455,12 @@ def test_between(closed: str, lo: int, hi: int, result: bool) -> None:
         binary(col("u"), "Lt", dyn(1)),
         binary(col("missing"), "Lt", dyn(1)),
         binary(col("i"), "Lt", col("i")),
+        binary(col("s"), "Eq", dyn(1)),
+        binary(col("i"), "Eq", scalar("String", "1")),
+        # categories compare as strings only for equality
+        binary(col("c"), "Lt", scalar("String", "A")),
+        binary(scalar("String", "A"), "Lt", col("c")),
+        between("c", scalar("String", "A"), scalar("String", "B"), "Both"),
         binary(dyn(1), "Lt", dyn(2)),
         binary(col("i"), "Lt", dyn(1.5, "Float")),
         binary(dyn(1.5, "Float"), "Lt", col("i")),
@@ -449,6 +482,52 @@ def test_between(closed: str, lo: int, hi: int, result: bool) -> None:
 )
 def test_not_understood(node: object) -> None:
     assert ppl._test(node, SCHEMA) is None
+
+
+@pytest.mark.parametrize(
+    ("node", "bounds", "result"),
+    [
+        (binary(col("s"), "Eq", scalar("String", "B")), {"s": ("A", "C")}, True),
+        (binary(col("s"), "Eq", scalar("String", "B")), {"s": ("C", "D")}, False),
+        # bounds of another type than the literal's never rule a row group out
+        (binary(col("s"), "Eq", scalar("String", "B")), {"s": (1, 2)}, True),
+        (binary(col("s"), "Lt", scalar("String", "B")), {"s": (5, 6)}, True),
+        (binary(col("i"), "Lt", dyn(0)), {"i": ("A", "B")}, True),
+        (binary(col("i"), "Gt", dyn(0)), {"i": ("A", "B")}, True),
+    ],
+    ids=str,
+)
+def test_bounds_of_another_type_keep_the_row_group(node: Any, bounds: dict[str, Any], result: bool) -> None:
+    test = ppl._test(node, SCHEMA)
+    assert test is not None
+    assert test(bounds) is result
+
+
+def test_string_between() -> None:
+    test = ppl._test(between("s", scalar("String", "Bb"), scalar("String", "C"), "Both"), SCHEMA)
+    assert test is not None
+    assert test(BOUNDS) is True
+    assert test({"s": ("C0", "D")}) is False
+    assert test({"s": ("A", "Ba")}) is False
+
+
+@pytest.mark.parametrize(
+    ("dtype", "stored", "same"),
+    [
+        (pl.String(), "string", True),
+        (pl.Categorical(), "string", True),
+        (pl.String(), "int", False),
+        (pl.Int64(), "string", False),
+        (pl.Categorical(), "int", False),
+        (pl.Binary(), "string", False),
+        (pl.Enum(["a"]), "string", False),
+        (pl.Int64(), "int", True),
+        (pl.Date(), "date32", True),
+    ],
+    ids=str,
+)
+def test_same_values(dtype: pl.DataType, stored: str, same: bool) -> None:
+    assert ppl._same_values(dtype, stored) is same
 
 
 def test_get() -> None:
@@ -559,3 +638,131 @@ def test_a_dotted_name_is_not_a_nested_leaf(tmp_path: pathlib.Path, monkeypatch:
         out, groups = kept(ppl.scan_parquet(p), monkeypatch, pl.col("a.b") < 20)
         assert out["a.b"].to_list() == list(range(20))
         assert groups == [0, 1]
+
+
+def tickers() -> pl.DataFrame:
+    """Sorted strings, as a trade file sorted by ticker has them: row group `g` of 100 rows
+    holds `A00`..`A99` for g = 0, `B00`..`B99` for g = 1, and so on."""
+    t = [f"{chr(65 + i // 100)}{i % 100:02d}" for i in range(N)]
+    return pl.DataFrame({"t": t, "c": pl.Series(t, dtype=pl.Categorical), "seq": list(range(N))})
+
+
+@pytest.mark.parametrize(
+    ("predicate", "kept"),
+    [
+        (pl.col("t") == "C05", [2]),
+        (pl.lit("C05") == pl.col("t"), [2]),
+        (pl.col("t") == "C", []),
+        (pl.col("t") == "a", []),
+        (pl.col("t") < "B", [0]),
+        (pl.col("t") <= "B00", [0, 1]),
+        (pl.col("t") > "I99", [9]),
+        (pl.col("t") >= "I", [8, 9]),
+        (pl.lit("B") > pl.col("t"), [0]),
+        (pl.col("t").is_between(pl.lit("B50"), pl.lit("C10")), [1, 2]),
+        ((pl.col("t") >= "C") & (pl.col("seq") < 150), []),
+        ((pl.col("t") == "A01") | (pl.col("t") == "J01"), [0, 9]),
+        (pl.col("t") != "C05", list(range(10))),
+        # Polars serializes the list of is_in as opaque bytes: not pruned
+        (pl.col("t").is_in(["C05"]), list(range(10))),
+        (pl.col("c") == "C05", [2]),
+        (pl.col("c") == pl.lit("C05", dtype=pl.Categorical), [2]),
+        # categories are compared as strings only for equality
+        (pl.col("c") < "B", list(range(10))),
+    ],
+    ids=str,
+)
+def test_strings_are_pruned(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, predicate: pl.Expr, kept: list[int]
+) -> None:
+    p = tmp_path / "t.parquet"
+    ppl.write_parquet(tickers(), p, row_group_size=100)
+    lf = ppl.scan_parquet(p)
+    spy = Spy(monkeypatch)
+    out = lf.filter(predicate).collect()
+    assert_frame_equal(out, tickers().filter(predicate))
+    assert spy.calls[0]["row_groups"] == kept
+
+
+def test_strings_beyond_ascii_are_pruned_in_code_point_order(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # UTF-8 byte order is code-point order, which UTF-16 order is not past U+FFFF
+    values = ["a", "z", "\xe9", "￿", "\U0001f600"]
+    p = tmp_path / "u.parquet"
+    ppl.write_parquet(pl.DataFrame({"t": values}), p, row_group_size=1)
+    for predicate, want in [
+        (pl.col("t") >= "\xe9", [2, 3, 4]),
+        (pl.col("t") > "￿", [4]),
+        (pl.col("t") < "\xe9", [0, 1]),
+        (pl.col("t") == "\U0001f600", [4]),
+    ]:
+        out, groups = kept(ppl.scan_parquet(p), monkeypatch, predicate)
+        assert out["t"].to_list() == [values[i] for i in want]
+        assert groups == want
+
+
+def test_column_bounds_of_strings(tmp_path: pathlib.Path) -> None:
+    import pyarrow as pa
+
+    values = ["b", "a", "d", "c"]
+    table = pa.table(
+        {
+            "s": pa.array(values),
+            "l": pa.array(values, pa.large_string()),
+            "v": pa.array(values, pa.string_view()),
+            "d": pa.array(values).dictionary_encode(),
+            "bin": pa.array([v.encode() for v in values]),
+            "i": pa.array([1, 2, 3, 4], pa.int32()),
+        }
+    )
+    p = tmp_path / "s.parquet"
+    ppc.write_table(table, p, row_group_size=2)
+    kinds, bounds = ppc.ParquetFile(p)._column_bounds()
+    assert kinds == {"s": "string", "l": "string", "v": "string", "d": "string", "i": "int"}
+    strings = [("a", "b"), ("c", "d")]
+    assert bounds == [{"s": s, "l": s, "v": s, "d": s, "i": i} for s, i in zip(strings, [(1, 2), (3, 4)], strict=True)]
+    for rg in bounds:
+        assert all(type(lo) is type(hi) for lo, hi in rg.values())
+
+
+def footer(data: bytes) -> tuple[bytes, bytes]:
+    """The file's bytes before its footer, and the footer."""
+    n = int.from_bytes(data[-8:-4], "little")
+    return data[: -8 - n], data[-8 - n : -8]
+
+
+def with_footer(body: bytes, meta: bytes) -> bytes:
+    return body + meta + len(meta).to_bytes(4, "little") + b"PAR1"
+
+
+def test_strings_without_column_orders_are_not_pruned(tmp_path: pathlib.Path) -> None:
+    import pyarrow as pa
+
+    p = tmp_path / "s.parquet"
+    ppc.write_table(pa.table({"s": ["a", "b", "c", "d"], "i": [1, 2, 3, 4]}), p, row_group_size=2)
+    body, meta = footer(p.read_bytes())
+    # FileMetaData's last field, column_orders (field 7, after created_by): a list of two
+    # TypeDefinedOrder unions, then the stop byte. Without it, string statistics are in the
+    # legacy signed byte order, which is not the order of strings
+    orders = b"\x19\x2c" + b"\x1c\x00\x00" * 2 + b"\x00"
+    assert meta.endswith(orders)
+    legacy = with_footer(body, meta[: -len(orders)] + b"\x00")
+    assert ppc.ParquetFile(p)._column_bounds()[1][0] == {"s": ("a", "b"), "i": (1, 2)}
+    kinds, bounds = ppc.ParquetFile(io.BytesIO(legacy))._column_bounds()
+    assert kinds == {"s": "string", "i": "int"}
+    assert bounds == [{"i": (1, 2)}, {"i": (3, 4)}]
+
+
+@pytest.mark.parametrize("which", ["min", "max"])
+def test_string_statistics_that_are_not_utf_8_are_not_bounds(tmp_path: pathlib.Path, which: str) -> None:
+    import pyarrow as pa
+
+    # a writer may truncate a bound in the middle of a character
+    marked = {"min": ["MARKED", "zz"], "max": ["aa", "MARKED"]}[which]
+    p = tmp_path / "s.parquet"
+    ppc.write_table(pa.table({"s": ["c", "d", *marked]}), p, row_group_size=2)
+    body, meta = footer(p.read_bytes())
+    assert b"MARKED" in meta
+    broken = with_footer(body, meta.replace(b"MARKED", b"MARKE\xff"))
+    assert ppc.ParquetFile(io.BytesIO(broken))._column_bounds()[1] == [{"s": ("c", "d")}, {}]

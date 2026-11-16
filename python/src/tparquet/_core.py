@@ -241,10 +241,12 @@ class ParquetFile:
         top-level column `a.b` and the field `b` of a struct `a`)."""
         return self._file.integer_bounds()
 
-    def _column_bounds(self) -> tuple[dict[str, str], list[dict[str, tuple[int, int]]]]:
-        """How each top-level column of signed integers, dates or timestamps is stored
-        (`int`, `date32`, `date64`, `timestamp[<unit>]`), and per row group `{name: (min,
-        max)}` from its statistics: what `tparquet.polars` prunes row groups with."""
+    def _column_bounds(self) -> tuple[dict[str, str], list[dict[str, tuple[int, int] | tuple[str, str]]]]:
+        """How each top-level column of signed integers, dates, timestamps or strings is
+        stored (`int`, `date32`, `date64`, `timestamp[<unit>]`, `string`), and per row group
+        `{name: (min, max)}` from its statistics (`str`s for strings, where the file orders
+        them as UTF-8 bytes and both are valid UTF-8): what `tparquet.polars` prunes row
+        groups with."""
         return self._file.column_bounds()
 
     def stream(
