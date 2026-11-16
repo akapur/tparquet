@@ -25,9 +25,10 @@ _SIGNED = (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.Date, pl.Datetime)
 _UNITS = {"Milliseconds": "ms", "Microseconds": "us", "Nanoseconds": "ns"}
 
 
-def read_parquet(source: Source, columns: Sequence[str] | None = None) -> pl.DataFrame:
-    """Reads a Parquet file (PCODEC or not) as a DataFrame; `columns` in the order given."""
-    df: pl.DataFrame = pl.DataFrame(ParquetFile(source).stream(columns))
+def read_parquet(source: Source, columns: Sequence[str] | None = None, *, threads: int | None = None) -> pl.DataFrame:
+    """Reads a Parquet file (PCODEC or not) as a DataFrame; `columns` in the order given,
+    decoding up to `threads` row groups at once (by default one per CPU)."""
+    df: pl.DataFrame = pl.DataFrame(ParquetFile(source).stream(columns, threads=threads))
     return df
 
 
@@ -241,7 +242,7 @@ DEFAULT_BATCH_SIZE = 65536
 
 
 def _source(
-    f: ParquetFile, batch_size: int | None, schema: pl.Schema
+    f: ParquetFile, batch_size: int | None, schema: pl.Schema, threads: int | None = None
 ) -> Callable[[list[str] | None, pl.Expr | None, int | None, int | None], Iterator[pl.DataFrame]]:
     """The IO plugin's generator over `f`, whose Polars schema is `schema`."""
 
@@ -252,7 +253,7 @@ def _source(
         if columns is not None and predicate is not None:
             columns = list(dict.fromkeys([*columns, *predicate.meta.root_names()]))
         row_groups, limit = _plan(f, predicate, schema, n_rows)
-        for batch in f.stream(columns, row_groups, batch_size or hint or DEFAULT_BATCH_SIZE, limit):
+        for batch in f.stream(columns, row_groups, batch_size or hint or DEFAULT_BATCH_SIZE, limit, threads=threads):
             df = pl.DataFrame(batch)
             if predicate is not None:
                 df = df.filter(predicate)
@@ -263,15 +264,18 @@ def _source(
     return source
 
 
-def scan_parquet(source: Source, *, batch_size: int | None = None) -> pl.LazyFrame:
+def scan_parquet(source: Source, *, batch_size: int | None = None, threads: int | None = None) -> pl.LazyFrame:
     """A LazyFrame over a Parquet file (PCODEC or not).
 
     The query's projection, row limit and predicate are pushed to the reader; the predicate
     is applied with Polars and also skips row groups whose integer, date and datetime
-    statistics rule it out. Batches have `batch_size` rows, else the size the engine asks for.
+    statistics rule it out. Batches have `batch_size` rows, else the size the engine asks for;
+    up to `threads` row groups are decoded at once (by default one per CPU).
     """
     if batch_size is not None and batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if threads is not None and threads <= 0:
+        raise ValueError(f"threads must be positive, got {threads}")
     f = ParquetFile(source)
     schema = pl.DataFrame(f.empty()).schema
-    return register_io_source(_source(f, batch_size, schema), schema=schema)
+    return register_io_source(_source(f, batch_size, schema, threads), schema=schema)

@@ -647,19 +647,24 @@ def test_public_defaults() -> None:
         "level": 8,
         "base": "zstd(3)",
     }
-    read = {"columns": None, "row_groups": None, "batch_size": 65536}
+    read = {"columns": None, "row_groups": None, "batch_size": 65536, "threads": None}
     assert defaults(ppc.read_table) == read
     assert defaults(ppc.read_batches) == read
     assert defaults(ppc.ParquetFile.read) == read
-    assert defaults(ppc.ParquetFile.iter_batches) == {"batch_size": 65536, "columns": None, "row_groups": None}
+    assert defaults(ppc.ParquetFile.iter_batches) == {
+        "batch_size": 65536,
+        "columns": None,
+        "row_groups": None,
+        "threads": None,
+    }
     assert defaults(ppc.ParquetFile.stream) == {**read, "limit": None}
-    assert defaults(ppl.scan_parquet) == {"batch_size": None}
-    assert defaults(ppl.read_parquet) == {"columns": None}
-    assert defaults(ppd.read_parquet) == {"columns": None}
-    assert defaults(pdd.ArrowSource) == {"columns": None, "batch_size": 65536}
-    assert defaults(pdd.register) == {"columns": None}
-    assert defaults(pdd.sql_view) == {"columns": None}
-    assert defaults(pdd.read_parquet) == {"connection": None, "columns": None}
+    assert defaults(ppl.scan_parquet) == {"batch_size": None, "threads": None}
+    assert defaults(ppl.read_parquet) == {"columns": None, "threads": None}
+    assert defaults(ppd.read_parquet) == {"columns": None, "threads": None}
+    assert defaults(pdd.ArrowSource) == {"columns": None, "batch_size": 65536, "threads": None}
+    assert defaults(pdd.register) == {"columns": None, "threads": None}
+    assert defaults(pdd.sql_view) == {"columns": None, "threads": None}
+    assert defaults(pdd.read_parquet) == {"connection": None, "columns": None, "threads": None}
 
 
 def test_rust_panics_become_pcodec_errors() -> None:

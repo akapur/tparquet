@@ -253,17 +253,21 @@ class ParquetFile:
         row_groups: Sequence[int] | None = None,
         batch_size: int = 65536,
         limit: int | None = None,
+        *,
+        threads: int | None = None,
     ) -> _lib.RecordBatchStream:
         """A one-shot stream of record batches, exposing `__arrow_c_stream__`.
 
         `columns` are top-level names, returned in that order; `row_groups` are read in the
-        order given; `limit` caps the number of rows.
+        order given; `limit` caps the number of rows. Up to `threads` row groups are decoded
+        at once (by default one per CPU); `threads=1` decodes on the thread that reads.
         """
         return self._file.stream(
             _names(columns),
             None if row_groups is None else [_int("row_groups", rg) for rg in row_groups],
             _int("batch_size", batch_size),
             _optional_int("limit", limit),
+            threads=_optional_int("threads", threads),
         )
 
     def iter_batches(
@@ -271,18 +275,25 @@ class ParquetFile:
         batch_size: int = 65536,
         columns: Sequence[str] | None = None,
         row_groups: Sequence[int] | None = None,
+        *,
+        threads: int | None = None,
     ) -> Iterator[pa.RecordBatch]:
         """Yields `pyarrow.RecordBatch` objects of at most `batch_size` rows."""
         pyarrow = _pyarrow()
-        for batch in self.stream(columns, row_groups, batch_size):
+        for batch in self.stream(columns, row_groups, batch_size, threads=threads):
             yield pyarrow.record_batch(batch)
 
     def read(
-        self, columns: Sequence[str] | None = None, row_groups: Sequence[int] | None = None, batch_size: int = 65536
+        self,
+        columns: Sequence[str] | None = None,
+        row_groups: Sequence[int] | None = None,
+        batch_size: int = 65536,
+        *,
+        threads: int | None = None,
     ) -> pa.Table:
         """Reads the file (or the given columns and row groups) as a `pyarrow.Table`."""
         pyarrow = _pyarrow()
-        stream = self.stream(columns, row_groups, batch_size)
+        stream = self.stream(columns, row_groups, batch_size, threads=threads)
         schema = pyarrow.schema(stream)
         table: pa.Table = pyarrow.Table.from_batches([pyarrow.record_batch(b) for b in stream], schema=schema)
         return table
@@ -297,14 +308,17 @@ def read_batches(
     columns: Sequence[str] | None = None,
     row_groups: Sequence[int] | None = None,
     batch_size: int = 65536,
+    *,
+    threads: int | None = None,
 ) -> _lib.RecordBatchStream:
     """Reads a Parquet file (PCODEC or not) as a one-shot Arrow stream.
 
     The result exposes `__arrow_c_stream__` and `__arrow_c_schema__`, so pyarrow
     (`pa.RecordBatchReader.from_stream`), Polars (`pl.DataFrame`), DuckDB and nanoarrow
-    read it without a copy. Batches are decoded as they are pulled, with the GIL released.
+    read it without a copy. Batches are decoded as they are pulled, with the GIL released,
+    up to `threads` row groups at once (see `ParquetFile.stream`).
     """
-    return ParquetFile(source).stream(columns, row_groups, batch_size)
+    return ParquetFile(source).stream(columns, row_groups, batch_size, threads=threads)
 
 
 def read_table(
@@ -312,13 +326,15 @@ def read_table(
     columns: Sequence[str] | None = None,
     row_groups: Sequence[int] | None = None,
     batch_size: int = 65536,
+    *,
+    threads: int | None = None,
 ) -> pa.Table:
     """Reads a Parquet file (PCODEC or not) as a `pyarrow.Table` (pyarrow must be installed).
 
     `columns` are top-level names, in the order wanted; `row_groups` are indices, read in the
     order given.
     """
-    return ParquetFile(source).read(columns, row_groups, batch_size)
+    return ParquetFile(source).read(columns, row_groups, batch_size, threads=threads)
 
 
 def _schema_capsule(schema: ArrowSchemaExportable) -> object:

@@ -12,6 +12,7 @@ mod sink;
 mod writer;
 
 use pyo3::prelude::*;
+use std::sync::LazyLock;
 
 #[pymodule]
 fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -30,5 +31,7 @@ fn _lib(m: &Bound<'_, PyModule>) -> PyResult<()> {
     codec::register(m)?;
     m.add_function(wrap_pyfunction!(errors::panic_for_tests, m)?)?;
     m.add_class::<errors::PanickingStream>()?;
+    m.add_function(wrap_pyfunction!(file::decode_threads_started, m)?)?;
+    LazyLock::force(&file::CPUS);
     Ok(())
 }

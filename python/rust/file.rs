@@ -1,6 +1,6 @@
 //! Reading: an open Parquet file (PCODEC or not), its metadata, and streams of its rows.
 
-use crate::errors::{detached, from_arrow, from_parquet, from_pcodec, invalid, os_error};
+use crate::errors::{detached, from_arrow, from_parquet, from_pcodec, invalid, os_error, panic_message};
 use crate::ffi::{ArrowSchema, RecordBatchStream, named};
 use crate::options::codec_name;
 use arrow_array::cast::AsArray;
@@ -17,9 +17,12 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyDict;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::thread::JoinHandle;
 use tparquet::parquet::DecodeResult;
 use tparquet::parquet::arrow::ProjectionMask;
 use tparquet::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -124,6 +127,21 @@ fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> s
 /// Ranges this close together are read as one: reading the gap costs less than another seek on
 /// a disk, and than another read of a record that a file system does not cache.
 const MAX_GAP: u64 = 1 << 20;
+
+/// The CPUs this process may run on: the threads a stream decodes with by default. Found once,
+/// when the module is imported, since finding them reads files (the cgroup's CPU quota).
+pub static CPUS: LazyLock<usize> = LazyLock::new(|| std::thread::available_parallelism().map_or(1, NonZeroUsize::get));
+
+/// The decoding threads started by this process, for the tests of how many run at once (a
+/// count of running threads would depend on how fast they finish).
+static STARTED: AtomicUsize = AtomicUsize::new(0);
+
+/// The decoding threads started so far, for the tests.
+#[pyfunction]
+#[pyo3(name = "_decode_threads_started")]
+pub fn decode_threads_started() -> usize {
+    STARTED.load(Ordering::Relaxed)
+}
 
 impl Reader {
     /// The bytes of each of `ranges`, with one read per run of ranges at most [`MAX_GAP`] apart.
@@ -239,12 +257,183 @@ pub fn open_bytes(py: Python<'_>, data: PyBackedBytes) -> PyResult<File> {
     File::load(py, || Ok(Source::Bytes(Bytes::from_owner(data))))
 }
 
-/// The batches of a push decoder, fed by `reader` with the byte ranges it asks for: whole
-/// column chunks, rather than each page as the page reader reaches it. The decoder ends a batch
-/// at each row group; these batches run across row groups, `batch_size` rows each but the last.
-struct Decoded {
+/// A push decoder fed by `reader` with the byte ranges it asks for: whole column chunks,
+/// rather than each page as the page reader reaches it.
+struct Fed {
     decoder: ParquetPushDecoder,
     reader: Reader,
+}
+
+impl Fed {
+    fn next(&mut self) -> ParquetResult<Option<RecordBatch>> {
+        loop {
+            match self.decoder.try_decode()? {
+                DecodeResult::Data(batch) => return Ok(Some(batch)),
+                DecodeResult::Finished => return Ok(None),
+                DecodeResult::NeedsData(ranges) => {
+                    let data = self.reader.fetch(&ranges)?;
+                    self.decoder.push_ranges(ranges, data)?;
+                }
+            }
+        }
+    }
+}
+
+/// What the decoders of a stream are built from.
+struct Plan {
+    metadata: ArrowReaderMetadata,
+    mask: ProjectionMask,
+    batch_size: usize,
+}
+
+impl Plan {
+    fn decoder(&self, row_groups: Vec<usize>, limit: Option<usize>) -> ParquetResult<ParquetPushDecoder> {
+        let mut builder = ParquetPushDecoderBuilder::new_with_metadata(self.metadata.clone())
+            .with_batch_size(self.batch_size)
+            .with_row_groups(row_groups)
+            .with_projection(self.mask.clone());
+        if let Some(limit) = limit {
+            builder = builder.with_limit(limit);
+        }
+        builder.build()
+    }
+
+    /// Each of `row_groups` with the rows of it that `limit` leaves, up to the last one it
+    /// reaches.
+    fn tasks(&self, row_groups: &[usize], limit: Option<usize>) -> Vec<(usize, Option<usize>)> {
+        let Some(mut left) = limit else {
+            return row_groups.iter().map(|&rg| (rg, None)).collect();
+        };
+        let md = self.metadata.metadata();
+        let mut tasks = vec![];
+        for &rg in row_groups {
+            if left == 0 {
+                break;
+            }
+            let rows = usize::try_from(md.row_group(rg).num_rows()).unwrap_or(0).min(left);
+            left -= rows;
+            tasks.push((rg, Some(rows)));
+        }
+        tasks
+    }
+
+    /// The batches of row group `rg` (at most `limit` rows), and the error that ended them
+    /// early; ended early without an error once `cancelled` is set.
+    fn decode(&self, rg: usize, limit: Option<usize>, reader: Reader, cancelled: &AtomicBool) -> RowGroup {
+        let mut batches = vec![];
+        let mut fed = match self.decoder(vec![rg], limit) {
+            Ok(decoder) => Fed { decoder, reader },
+            Err(e) => return RowGroup { batches, error: Some(e) },
+        };
+        while !cancelled.load(Ordering::Relaxed) {
+            match fed.next() {
+                Ok(Some(batch)) => batches.push(batch),
+                Ok(None) => break,
+                Err(e) => return RowGroup { batches, error: Some(e) },
+            }
+        }
+        RowGroup { batches, error: None }
+    }
+}
+
+/// The batches of one row group, and the error that ended its decoding early.
+struct RowGroup {
+    batches: Vec<RecordBatch>,
+    error: Option<ParquetError>,
+}
+
+/// A row group being decoded by a thread of its own, or one to decode on the thread that takes
+/// its batches when no thread could be started.
+enum Started {
+    Thread(JoinHandle<RowGroup>),
+    Here(usize, Option<usize>),
+}
+
+/// Row groups decoded each by a thread of its own and taken in the order asked: at most
+/// `threads` decoded or being decoded at once, the one whose batches are being taken among them.
+struct Threads {
+    plan: Arc<Plan>,
+    source: Source,
+    tasks: std::vec::IntoIter<(usize, Option<usize>)>,
+    threads: usize,
+    running: VecDeque<Started>,
+    cancelled: Arc<AtomicBool>,
+    current: std::vec::IntoIter<RecordBatch>,
+    error: Option<ParquetError>,
+}
+
+impl Threads {
+    fn next(&mut self) -> ParquetResult<Option<RecordBatch>> {
+        loop {
+            if let Some(batch) = self.current.next() {
+                return Ok(Some(batch));
+            }
+            if let Some(e) = self.error.take() {
+                return Err(e);
+            }
+            self.start();
+            let done = match self.running.pop_front() {
+                None => return Ok(None),
+                Some(Started::Thread(thread)) => thread.join().unwrap_or_else(|panic| RowGroup {
+                    batches: vec![],
+                    error: Some(ParquetError::General(panic_message(&*panic))),
+                }),
+                Some(Started::Here(rg, limit)) => self.plan.decode(rg, limit, self.source.reader(), &self.cancelled),
+            };
+            self.current = done.batches.into_iter();
+            self.error = done.error;
+        }
+    }
+
+    /// Starts decoding row groups until `threads` are in memory or none is left.
+    fn start(&mut self) {
+        while self.running.len() < self.threads
+            && let Some((rg, limit)) = self.tasks.next()
+        {
+            let (plan, reader, cancelled) = (self.plan.clone(), self.source.reader(), self.cancelled.clone());
+            let thread = std::thread::Builder::new()
+                .name("tparquet-decode".into())
+                .spawn(move || plan.decode(rg, limit, reader, &cancelled));
+            self.running.push_back(thread.map_or(Started::Here(rg, limit), |thread| {
+                STARTED.fetch_add(1, Ordering::Relaxed);
+                Started::Thread(thread)
+            }));
+        }
+    }
+}
+
+impl Drop for Threads {
+    /// Stops the threads: none outlives the stream, nor keeps its file open.
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        for started in self.running.drain(..) {
+            if let Started::Thread(thread) = started {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+/// Where a stream's batches are decoded.
+enum Decoder {
+    /// On the thread that takes them, one row group after the other.
+    Here(Fed),
+    Threads(Threads),
+}
+
+impl Decoder {
+    fn next(&mut self) -> ParquetResult<Option<RecordBatch>> {
+        match self {
+            Self::Here(fed) => fed.next(),
+            Self::Threads(threads) => threads.next(),
+        }
+    }
+}
+
+/// The batches of a [`Decoder`]. It ends a batch at each row group; these batches run across
+/// row groups, `batch_size` rows each but the last.
+struct Decoded {
+    decoder: Decoder,
     batch_size: usize,
     pending: VecDeque<RecordBatch>,
     pending_rows: usize,
@@ -252,13 +441,13 @@ struct Decoded {
 }
 
 impl Decoded {
-    fn new(decoder: ParquetPushDecoder, reader: Reader, batch_size: usize) -> Self {
-        Self { decoder, reader, batch_size, pending: VecDeque::new(), pending_rows: 0, failed: false }
+    fn new(decoder: Decoder, batch_size: usize) -> Self {
+        Self { decoder, batch_size, pending: VecDeque::new(), pending_rows: 0, failed: false }
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>, ArrowError> {
         while self.pending_rows < self.batch_size {
-            match self.next_decoded()? {
+            match self.decoder.next()? {
                 Some(batch) if self.pending.is_empty() && batch.num_rows() == self.batch_size => {
                     return Ok(Some(batch));
                 }
@@ -291,19 +480,6 @@ impl Decoded {
         match parts.as_slice() {
             [one] => Ok(one.clone()),
             _ => concat_parts(&parts, rows),
-        }
-    }
-
-    fn next_decoded(&mut self) -> ParquetResult<Option<RecordBatch>> {
-        loop {
-            match self.decoder.try_decode()? {
-                DecodeResult::Data(batch) => return Ok(Some(batch)),
-                DecodeResult::Finished => return Ok(None),
-                DecodeResult::NeedsData(ranges) => {
-                    let data = self.reader.fetch(&ranges)?;
-                    self.decoder.push_ranges(ranges, data)?;
-                }
-            }
         }
     }
 }
@@ -408,24 +584,32 @@ impl File {
     }
 
     /// A stream of the file's rows: the given top-level `columns` in that order, the given
-    /// `row_groups` in that order, at most `limit` rows.
-    #[pyo3(signature = (columns=None, row_groups=None, batch_size=65536, limit=None))]
+    /// `row_groups` in that order, at most `limit` rows. Up to `threads` row groups (by default
+    /// as many as the CPUs) are decoded at once, by threads of the stream's own.
+    #[pyo3(signature = (columns=None, row_groups=None, batch_size=65536, limit=None, *, threads=None))]
     fn stream(
         &self,
         columns: Option<Vec<String>>,
         row_groups: Option<Vec<i64>>,
         batch_size: i64,
         limit: Option<i64>,
+        threads: Option<i64>,
     ) -> PyResult<RecordBatchStream> {
+        let threads = threads
+            .map(|threads| {
+                usize::try_from(threads)
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| invalid(format!("threads must be positive, got {threads}")))
+            })
+            .transpose()?;
         let batch_size = usize::try_from(batch_size)
             .ok()
             .filter(|n| *n > 0)
             .ok_or_else(|| invalid(format!("batch_size must be positive, got {batch_size}")))?;
-        let mut builder =
-            ParquetPushDecoderBuilder::new_with_metadata(self.metadata.clone()).with_batch_size(batch_size);
-        if let Some(rgs) = row_groups {
-            let n = self.metadata.metadata().num_row_groups();
-            let rgs = rgs
+        let n = self.metadata.metadata().num_row_groups();
+        let row_groups = match row_groups {
+            Some(rgs) => rgs
                 .iter()
                 .map(|&rg| {
                     usize::try_from(rg)
@@ -433,18 +617,36 @@ impl File {
                         .filter(|i| *i < n)
                         .ok_or_else(|| invalid(format!("row group {rg} out of range (the file has {n})")))
                 })
-                .collect::<PyResult<Vec<_>>>()?;
-            builder = builder.with_row_groups(rgs);
-        }
-        if let Some(limit) = limit {
-            let limit =
-                usize::try_from(limit).map_err(|_| invalid(format!("limit must not be negative, got {limit}")))?;
-            builder = builder.with_limit(limit);
-        }
+                .collect::<PyResult<Vec<_>>>()?,
+            None => (0..n).collect(),
+        };
+        let limit = limit
+            .map(|limit| {
+                usize::try_from(limit).map_err(|_| invalid(format!("limit must not be negative, got {limit}")))
+            })
+            .transpose()?;
         let (sorted, order, schema) = self.projection(columns)?;
         let mask = ProjectionMask::roots(self.metadata.parquet_schema(), sorted);
-        let decoder = builder.with_projection(mask).build().map_err(from_parquet)?;
-        let inner = Decoded::new(decoder, self.reader(), batch_size);
+        let plan = Plan { metadata: self.metadata.clone(), mask, batch_size };
+        let tasks = plan.tasks(&row_groups, limit);
+        let threads = threads.unwrap_or(*CPUS).min(tasks.len());
+        // built in either case, so that its errors are this call's
+        let decoder = plan.decoder(row_groups, limit).map_err(from_parquet)?;
+        let decoder = if threads > 1 {
+            Decoder::Threads(Threads {
+                plan: Arc::new(plan),
+                source: self.source.clone(),
+                tasks: tasks.into_iter(),
+                threads,
+                running: VecDeque::new(),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                current: vec![].into_iter(),
+                error: None,
+            })
+        } else {
+            Decoder::Here(Fed { decoder, reader: self.reader() })
+        };
+        let inner = Decoded::new(decoder, batch_size);
         let name = self.source.name();
         Ok(RecordBatchStream::new(Box::new(Reordered { inner, order, schema, name })))
     }

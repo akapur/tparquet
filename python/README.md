@@ -24,6 +24,9 @@ stream = tpq.read_batches("trades.parquet")              # __arrow_c_stream__, f
 - `tparquet.polars`: `scan_parquet` (projection, limit, predicate and row-group pruning
   pushed down), `read_parquet`, `write_parquet`.
 - `tparquet.duckdb`: `register`, `sql_view`, `read_parquet`.
+- Every reader takes a keyword `threads`: up to that many row groups are decoded at once, each
+  by a thread of its own (by default one per CPU), and at most that many decoded row groups are
+  held at once; `threads=1` decodes on the thread that reads. The batches are the same either way.
 
 Paths are `str`, `bytes` or `os.PathLike` (names that are not UTF-8 work), or binary file objects
 (a text-mode file is a `TypeError`; a file object to read from is read to its end once). Errors are

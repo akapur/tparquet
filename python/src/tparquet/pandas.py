@@ -91,19 +91,21 @@ def _index_columns(schema: pa.Schema) -> list[str]:
     return [c for c in metadata.get("index_columns", []) if isinstance(c, str)]
 
 
-def read_parquet(source: Source, columns: Sequence[str] | None = None, **to_pandas_kwargs: Any) -> pd.DataFrame:
+def read_parquet(
+    source: Source, columns: Sequence[str] | None = None, *, threads: int | None = None, **to_pandas_kwargs: Any
+) -> pd.DataFrame:
     """Reads a Parquet file (PCODEC or not) as a DataFrame, restoring the index and dtypes
     from the pandas metadata.
 
     `columns` selects data columns; the index columns are read too, as `pandas.read_parquet`
-    does. The keyword arguments go to `pyarrow.Table.to_pandas` (`types_mapper`,
-    `categories`...).
+    does. Up to `threads` row groups are decoded at once (by default one per CPU). The other
+    keyword arguments go to `pyarrow.Table.to_pandas` (`types_mapper`, `categories`...).
     """
     f = ParquetFile(source)
     wanted = _names(columns)
     if wanted is not None:
         columns = wanted + [c for c in _index_columns(f.schema) if c not in wanted]
-    return _decode_categories(f.read(columns=columns)).to_pandas(**to_pandas_kwargs)
+    return _decode_categories(f.read(columns=columns, threads=threads)).to_pandas(**to_pandas_kwargs)
 
 
 def to_parquet(
