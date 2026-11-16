@@ -14,6 +14,7 @@ import sys
 import textwrap
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
@@ -95,6 +96,73 @@ def test_a_file_truncated_after_it_was_opened(tmp_path: pathlib.Path) -> None:
         handle.truncate(100)
     with pytest.raises(ppc.PcodecError, match=r"t\.parquet"):
         f.read()
+
+
+def chunk_start(path: pathlib.Path, row_group: int) -> int:
+    column = pq.ParquetFile(path).metadata.row_group(row_group).column(0)
+    return column.dictionary_page_offset or column.data_page_offset
+
+
+def test_a_column_chunk_cut_to_one_byte_after_it_was_opened(tmp_path: pathlib.Path) -> None:
+    path = tmp_path / "t.parquet"
+    ppc.write_table(pa.table({"i": pa.array(range(500), pa.int64())}), path)
+    f = ppc.ParquetFile(path)
+    with open(path, "r+b") as handle:
+        handle.truncate(chunk_start(path, 0) + 1)
+    with pytest.raises(ppc.PcodecError, match="unexpected end of file"):
+        f.read()
+
+
+def test_rows_before_a_row_group_cut_off_after_opening_are_returned_first(tmp_path: pathlib.Path) -> None:
+    path = tmp_path / "t.parquet"
+    ppc.write_table(pa.table({"i": pa.array(range(300), pa.int64())}), path, row_group_size=100)
+    f = ppc.ParquetFile(path)
+    with open(path, "r+b") as handle:
+        handle.truncate(chunk_start(path, 2))
+    batches = f.iter_batches(batch_size=200)
+    assert next(batches).num_rows == 200
+    with pytest.raises(ppc.PcodecError, match="unexpected end of file"):
+        next(batches)
+
+
+@pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="needs /proc/self/fd")
+def test_a_read_error_is_raised_not_retried(tmp_path: pathlib.Path) -> None:
+    path = tmp_path / "t.parquet"
+    path.write_bytes(small_file())
+    f = ppc.ParquetFile(path)
+    fd = next(int(n) for n in os.listdir("/proc/self/fd") if os.path.realpath(f"/proc/self/fd/{n}") == str(path))
+    directory = os.open(tmp_path, os.O_RDONLY)
+    os.dup2(directory, fd)
+    os.close(directory)
+    with pytest.raises(ppc.PcodecError, match="Is a directory"):
+        f.read()
+
+
+def footer_in_the_last_value() -> tuple[bytes, int]:
+    """A file whose one column chunk runs to its last byte, and the length of its footer: the
+    footer (with its length and magic) is the end of the chunk's last value, as long as the
+    value written there, which it replaces."""
+    footer = 0
+    for _ in range(8):
+        buf = io.BytesIO()
+        table = pa.table({"b": pa.array([b"first", b"\0" * footer], pa.binary())})
+        pq.write_table(table, buf, compression="none", use_dictionary=False, write_statistics=False)
+        data = buf.getvalue()
+        written = int.from_bytes(data[-8:-4], "little") + 8
+        if written == footer:
+            return data[: -2 * footer] + data[-footer:], footer
+        footer = written
+    raise AssertionError("the footer's length did not settle")
+
+
+def test_a_column_chunk_that_ends_at_the_end_of_the_file(tmp_path: pathlib.Path) -> None:
+    data, footer = footer_in_the_last_value()
+    path = tmp_path / "t.parquet"
+    path.write_bytes(data)
+    assert ppc.read_table(path).column("b").to_pylist() == [b"first", data[-footer:]]
+    path.write_bytes(data[:4] + data[5:])
+    with pytest.raises(ppc.PcodecError, match="past the end of the file"):
+        ppc.read_table(path)
 
 
 @given(seed=st.integers(0, 2**32 - 1), flips=st.integers(1, 12))
