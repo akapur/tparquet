@@ -251,7 +251,7 @@ def test_timestamps_of_every_unit_and_zone(unit: str, tz: str | None) -> None:
             assert_frame_equal(got, df.filter(predicate))
 
 
-PRUNABLE = ["i8", "i16", "i32", "i64", "d", "t_ms", "t_us_utc", "t_ns_tokyo"]
+PRUNABLE = ["i8", "i16", "i32", "i64", "d", "t_ms", "t_us_utc", "t_ns_tokyo", "s"]
 
 
 @st.composite
@@ -284,11 +284,13 @@ def comparisons(draw: st.DrawFn) -> tuple[pl.DataFrame, str, str, Any, int]:
     else:
         v = next((x for x in draw(series_values(name, 4)) if x is not None), None)
         if v is None:
-            v = {"d": datetime.date(2000, 1, 1)}.get(name, EPOCH if name.startswith("t_") else 0)
+            v = {"d": datetime.date(2000, 1, 1), "s": "k0"}.get(name, EPOCH if name.startswith("t_") else 0)
     one = {"d": datetime.timedelta(days=1)}.get(name, datetime.timedelta(seconds=1) if name.startswith("t_") else 1)
     if isinstance(dtype, pl.Datetime) and draw(st.booleans()):
         one = datetime.timedelta(microseconds=1) if dtype.time_unit != "ms" else datetime.timedelta(milliseconds=1)
-    v = v + one * draw(st.sampled_from([-1, 0, 0, 1]))
+    step = draw(st.sampled_from([-1, 0, 0, 1]))
+    # the string just below `v` (a prefix of it), `v`, and the string just above
+    v = {-1: v[:-1], 0: v, 1: v + "\x00"}[step] if name == "s" else v + one * step
     if isinstance(dtype, pl.Datetime) and dtype.time_zone is not None and v.tzinfo is None:
         v = v.replace(tzinfo=datetime.timezone.utc).astimezone(zoneinfo.ZoneInfo(dtype.time_zone))
     if name in BITS:

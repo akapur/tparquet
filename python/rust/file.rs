@@ -27,6 +27,8 @@ use tparquet::parquet::DecodeResult;
 use tparquet::parquet::arrow::ProjectionMask;
 use tparquet::parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use tparquet::parquet::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder};
+use tparquet::parquet::basic::{ColumnOrder, SortOrder};
+use tparquet::parquet::data_type::ByteArray;
 use tparquet::parquet::errors::{ParquetError, Result as ParquetResult};
 use tparquet::parquet::file::reader::{ChunkReader, Length};
 use tparquet::parquet::file::statistics::Statistics;
@@ -712,13 +714,15 @@ impl File {
             .collect()
     }
 
-    /// The statistics of the top-level columns that hold signed integers, dates or
-    /// timestamps: how each is stored (`int`, `date32`, `date64` or `timestamp[<unit>]`,
-    /// dictionaries by their values), and per row group `{name: (min, max)}` of those whose
-    /// statistics give both bounds. A name is a top-level field, never a nested leaf with the
-    /// same dotted path.
+    /// The statistics of the top-level columns that hold signed integers, dates, timestamps
+    /// or strings: how each is stored (`int`, `date32`, `date64`, `timestamp[<unit>]` or
+    /// `string`, dictionaries by their values), and per row group `{name: (min, max)}` of
+    /// those whose statistics give both bounds: `int`s, or `str`s for strings. String bounds
+    /// are given only where the file declares the UTF-8 byte order for the column (older
+    /// files ordered them as signed bytes) and both are valid UTF-8 (a truncated bound may
+    /// not be). A name is a top-level field, never a nested leaf with the same dotted path.
     #[allow(clippy::type_complexity)]
-    fn column_bounds(&self) -> (BTreeMap<String, String>, Vec<BTreeMap<String, (i64, i64)>>) {
+    fn column_bounds(&self) -> (BTreeMap<String, String>, Vec<BTreeMap<String, Bounds>>) {
         let md = self.metadata.metadata();
         let leaves = md.file_metadata().schema_descr().columns();
         let mut kinds = BTreeMap::new();
@@ -730,8 +734,13 @@ impl File {
             };
             let leaf = leaves.iter().position(|c| c.path().parts() == std::slice::from_ref(field.name()));
             if let (Some(kind), Some(leaf)) = (kind, leaf) {
+                let string = kind == "string";
                 kinds.insert(field.name().clone(), kind);
-                columns.push((field.name().clone(), leaf));
+                if !string
+                    || md.file_metadata().column_order(leaf) == ColumnOrder::TYPE_DEFINED_ORDER(SortOrder::UNSIGNED)
+                {
+                    columns.push((field.name().clone(), leaf, string));
+                }
             }
         }
         let bounds = md
@@ -740,7 +749,17 @@ impl File {
             .map(|rg| {
                 columns
                     .iter()
-                    .filter_map(|(name, leaf)| Some((name.clone(), bounds(rg.column(*leaf).statistics()?)?)))
+                    .filter_map(|(name, leaf, string)| {
+                        let stats = rg.column(*leaf).statistics()?;
+                        let b = if *string {
+                            let (lo, hi) = string_bounds(stats)?;
+                            Bounds::Str(lo, hi)
+                        } else {
+                            let (lo, hi) = bounds(stats)?;
+                            Bounds::Int(lo, hi)
+                        };
+                        Some((name.clone(), b))
+                    })
                     .collect()
             })
             .collect();
@@ -765,9 +784,25 @@ fn bounds(s: &Statistics) -> Option<(i64, i64)> {
     }
 }
 
-/// How a column of type `t` is stored, for the types whose statistics bound signed integers.
+/// A column's `(min, max)`, to Python a tuple of two `int`s or of two `str`s.
+#[derive(IntoPyObject)]
+enum Bounds {
+    Int(i64, i64),
+    Str(String, String),
+}
+
+/// The bounds of `BYTE_ARRAY` statistics when both are UTF-8.
+fn string_bounds(s: &Statistics) -> Option<(String, String)> {
+    let Statistics::ByteArray(s) = s else { return None };
+    let utf8 = |b: &ByteArray| String::from_utf8(b.data().to_vec()).ok();
+    Some((utf8(s.min_opt()?)?, utf8(s.max_opt()?)?))
+}
+
+/// How a column of type `t` is stored, for the types whose statistics bound signed integers
+/// or strings.
 fn stored_kind(t: &DataType) -> Option<String> {
     Some(match t {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "string".into(),
         DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => "int".into(),
         DataType::Date32 => "date32".into(),
         DataType::Date64 => "date64".into(),

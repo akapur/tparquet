@@ -22,6 +22,10 @@ __all__ = ["read_parquet", "scan_parquet", "write_parquet"]
 
 #: Polars dtypes whose values are the stored signed integers the statistics bound.
 _SIGNED = (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.Date, pl.Datetime)
+#: Polars dtypes whose values are the strings the statistics bound (in UTF-8 byte order, which
+#: is the code-point order Python compares `str`s in). Categories only compare as strings for
+#: equality.
+_STRINGS = (pl.String, pl.Categorical)
 _UNITS = {"Milliseconds": "ms", "Microseconds": "us", "Nanoseconds": "ns"}
 
 
@@ -72,9 +76,9 @@ def _get(node: Any, *keys: str) -> Any:
     return node
 
 
-def _literal(node: Any, dtype: pl.DataType) -> int | None:
-    """The stored integer of a literal compared with a column of `dtype`, or `None` when the
-    literal is not one this pruner understands exactly."""
+def _literal(node: Any, dtype: pl.DataType) -> int | str | None:
+    """The stored integer or string of a literal compared with a column of `dtype`, or `None`
+    when the literal is not one this pruner understands exactly."""
     lit = _get(node, "Literal")
     if not isinstance(lit, dict):
         return None
@@ -94,6 +98,11 @@ def _literal(node: Any, dtype: pl.DataType) -> int | None:
             return int(value_)
     if kind in {"Int8", "Int16", "Int32", "Int64"} and isinstance(v, int) and dtype.is_integer():
         return v
+    if kind == "String" and isinstance(v, str) and isinstance(dtype, _STRINGS):
+        return v
+    category = _get(v, "value")
+    if kind == "Categorical" and isinstance(category, str) and isinstance(dtype, pl.Categorical):
+        return category
     return None
 
 
@@ -101,7 +110,7 @@ _FLIP = {"Lt": "Gt", "LtEq": "GtEq", "Gt": "Lt", "GtEq": "LtEq", "Eq": "Eq"}
 
 
 #: For each comparison `column <op> v`: whether a value in `lo..=hi` may satisfy it.
-_MAY: dict[str, Callable[[int, int, int], bool]] = {
+_MAY: dict[str, Callable[[Any, Any, Any], bool]] = {
     "Eq": lambda lo, hi, v: lo <= v <= hi,
     "Lt": lambda lo, hi, v: lo < v,
     "LtEq": lambda lo, hi, v: lo <= v,
@@ -109,20 +118,21 @@ _MAY: dict[str, Callable[[int, int, int], bool]] = {
     "GtEq": lambda lo, hi, v: hi >= v,
 }
 
+Bounds = dict[str, tuple[int, int] | tuple[str, str]]
 
-def _compare(name: str, op: str, v: int) -> Callable[[dict[str, tuple[int, int]]], bool]:
+
+def _compare(name: str, op: str, v: int | str) -> Callable[[Bounds], bool]:
     test = _MAY[op]
 
-    def may(bounds: dict[str, tuple[int, int]]) -> bool:
+    def may(bounds: Bounds) -> bool:
         if name not in bounds:
             return True
         lo, hi = bounds[name]
+        if type(lo) is not type(v):
+            return True
         return test(lo, hi, v)
 
     return may
-
-
-Bounds = dict[str, tuple[int, int]]
 
 
 def _both(a: Callable[[Bounds], bool], b: Callable[[Bounds], bool]) -> Callable[[Bounds], bool]:
@@ -133,15 +143,19 @@ def _either(a: Callable[[Bounds], bool], b: Callable[[Bounds], bool]) -> Callabl
     return lambda bounds: a(bounds) or b(bounds)
 
 
-def _column(node: Any, schema: pl.Schema) -> str | None:
-    """The name of a column node of a prunable dtype."""
+def _column(node: Any, schema: pl.Schema, equality: bool = False) -> str | None:
+    """The name of a column node of a dtype a comparison can prune; of a categorical one only
+    for an `equality`."""
     name = _get(node, "Column")
-    if isinstance(name, str) and isinstance(schema.get(name), _SIGNED):
+    if not isinstance(name, str):
+        return None
+    dtype = schema.get(name)
+    if isinstance(dtype, (*_SIGNED, pl.String)) or (equality and isinstance(dtype, pl.Categorical)):
         return name
     return None
 
 
-def _test(node: Any, schema: pl.Schema) -> Callable[[dict[str, tuple[int, int]]], bool] | None:
+def _test(node: Any, schema: pl.Schema) -> Callable[[Bounds], bool] | None:
     """A test of row-group bounds for the predicate `node` (serialized Polars expression),
     or `None` when the predicate is not understood (the row group is then kept)."""
     if not isinstance(node, dict):
@@ -163,11 +177,11 @@ def _test(node: Any, schema: pl.Schema) -> Callable[[dict[str, tuple[int, int]]]
             return _either(a, b)
         if op not in _FLIP:
             return None
-        name = _column(left, schema)
+        name = _column(left, schema, op == "Eq")
         if name is not None:
             v = _literal(right, schema[name])
             return None if v is None else _compare(name, op, v)
-        name = _column(right, schema)
+        name = _column(right, schema, op == "Eq")
         if name is not None:
             v = _literal(left, schema[name])
             return None if v is None else _compare(name, _FLIP[op], v)
@@ -192,8 +206,10 @@ def _test(node: Any, schema: pl.Schema) -> Callable[[dict[str, tuple[int, int]]]
 
 
 def _same_values(dtype: pl.DataType, stored: str) -> bool:
-    """Whether a Polars column of `dtype` holds the integers a column stored as `stored`
-    (`ParquetFile._column_bounds`) has: Polars reads `timestamp[s]` in milliseconds."""
+    """Whether a Polars column of `dtype` holds the integers or strings a column stored as
+    `stored` (`ParquetFile._column_bounds`) has: Polars reads `timestamp[s]` in milliseconds."""
+    if isinstance(dtype, _STRINGS):
+        return stored == "string"
     if isinstance(dtype, pl.Datetime):
         return stored == f"timestamp[{dtype.time_unit}]" or (stored == "date64" and dtype.time_unit == "ms")
     if dtype == pl.Date:
@@ -268,7 +284,7 @@ def scan_parquet(source: Source, *, batch_size: int | None = None, threads: int 
     """A LazyFrame over a Parquet file (PCODEC or not).
 
     The query's projection, row limit and predicate are pushed to the reader; the predicate
-    is applied with Polars and also skips row groups whose integer, date and datetime
+    is applied with Polars and also skips row groups whose integer, date, datetime and string
     statistics rule it out. Batches have `batch_size` rows, else the size the engine asks for;
     up to `threads` row groups are decoded at once (by default one per CPU).
     """
