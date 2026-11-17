@@ -65,7 +65,8 @@ order given) and row limit applied, collected.
 
 ## Writing
 
-`df.tparquet.write(target, *, policy="auto", columns=None, level=8, base="zstd(3)", row_group_size=None)`
+`df.tparquet.write(target, *, policy="auto", columns=None, level=8, base="zstd(3)", row_group_size=None,
+data_page_size=None, data_page_row_count_limit=None, write_batch_size=None, dictionary=None, statistics=None)`
 writes a DataFrame and returns the codec of every leaf column. Like `sink` below, it writes a
 path through a temporary file, so a write that fails leaves the target as it was. A column of
 dtype `Object` is refused (`ComputeError`), as Polars' own writer refuses it.
@@ -83,7 +84,9 @@ The options: with `policy="auto"` each INT32/INT64/FLOAT/DOUBLE column gets whic
 and the base codec is smaller on the first batch with rows; `"pcodec"` and `"base"` force one.
 `columns` maps a column name or dotted leaf path to its own policy, `level` is the pcodec level
 (0 to 12), `base` the codec of the other columns (`"zstd(3)"`, `"snappy"`, `"uncompressed"`...),
-and `row_group_size` the most rows per row group.
+and `row_group_size` the most rows per row group. The page options (`data_page_size`,
+`data_page_row_count_limit`, `write_batch_size`, `dictionary`, `statistics`) are those of
+`tparquet.Writer`.
 
 Known bug (tparquet's Polars reader, to be fixed there): over a single file, a row limit before
 a filter, such as `scan_tparquet("one.parquet").head(n).filter(...)`, gives wrong rows: the limit

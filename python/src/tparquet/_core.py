@@ -22,6 +22,8 @@ PcodecError = _lib.PcodecError
 
 #: A codec policy for INT32, INT64, FLOAT and DOUBLE columns.
 Policy = Literal["auto", "pcodec", "base"]
+#: The statistics a file holds: none, per column chunk, or also per page (the column index).
+Statistics = Literal["none", "chunk", "page"]
 
 
 class Readable(Protocol):
@@ -133,6 +135,19 @@ def _names(columns: Sequence[str] | None) -> list[str] | None:
     return None if columns is None else list(columns)
 
 
+def _dictionary(dictionary: bool | Sequence[str] | None) -> tuple[bool | None, list[str]]:
+    """The dictionary setting of every column, and the columns that have one regardless."""
+    if dictionary is None or isinstance(dictionary, bool):
+        return dictionary, []
+    if isinstance(dictionary, (str, bytes)) or not hasattr(dictionary, "__iter__"):
+        raise TypeError(f"dictionary must be a bool or a sequence of names, not a {type(dictionary).__name__}")
+    names = list(dictionary)
+    for name in names:
+        if not isinstance(name, str):
+            raise TypeError(f"dictionary names must be str, got {type(name).__name__}")
+    return False, names
+
+
 def _options(
     policy: Policy,
     columns: Mapping[str, Policy] | None,
@@ -140,7 +155,15 @@ def _options(
     base: str,
     row_group_size: int | None,
     encodings: Mapping[str, str] | None = None,
+    data_page_size: int | None = None,
+    data_page_row_count_limit: int | None = None,
+    write_batch_size: int | None = None,
+    dictionary: bool | Sequence[str] | None = None,
+    statistics: Statistics | None = None,
 ) -> dict[str, Any]:
+    if statistics is not None and not isinstance(statistics, str):
+        raise TypeError(f"statistics must be a str, got {type(statistics).__name__}")
+    every, named = _dictionary(dictionary)
     return {
         "encodings": dict(encodings or {}),
         "policy": policy,
@@ -148,6 +171,12 @@ def _options(
         "level": _int("level", level),
         "base": base,
         "row_group_size": _optional_int("row_group_size", row_group_size),
+        "data_page_size": _optional_int("data_page_size", data_page_size),
+        "data_page_row_count_limit": _optional_int("data_page_row_count_limit", data_page_row_count_limit),
+        "write_batch_size": _optional_int("write_batch_size", write_batch_size),
+        "dictionary": every,
+        "dictionary_columns": named,
+        "statistics": statistics,
     }
 
 
@@ -360,6 +389,14 @@ class Writer:
     column, named as in `columns`, to the Parquet encoding it is written with when it gets the
     base codec (`"ALP"`, `"BYTE_STREAM_SPLIT"`, `"DELTA_BINARY_PACKED"`...), without a
     dictionary; PCODEC columns are always PLAIN.
+
+    `data_page_size` (bytes before compression) and `data_page_row_count_limit` end a data
+    page; in columns with nulls the row count is checked once per write batch of
+    `write_batch_size` rows (1024 by default), so a lower limit needs smaller batches.
+    `dictionary` turns dictionary encoding on or off for every column, or names the only
+    columns (as in `columns`) that get it; PCODEC columns and columns with an encoding never
+    have one. `statistics` is `"none"`, `"chunk"` or `"page"` (the default, which also writes
+    the column index); the offset index is always written. `None` leaves the writer's default.
     """
 
     def __init__(
@@ -373,10 +410,29 @@ class Writer:
         base: str = "zstd(3)",  # pragma: no mutate
         row_group_size: int | None = None,
         encodings: Mapping[str, str] | None = None,
+        *,
+        data_page_size: int | None = None,
+        data_page_row_count_limit: int | None = None,
+        write_batch_size: int | None = None,
+        dictionary: bool | Sequence[str] | None = None,
+        statistics: Statistics | None = None,
     ) -> None:
         target = _sink(sink)
         capsule = _schema_capsule(schema)
-        self._writer = _lib.Writer(target, capsule, _options(policy, columns, level, base, row_group_size, encodings))
+        options = _options(
+            policy,
+            columns,
+            level,
+            base,
+            row_group_size,
+            encodings,
+            data_page_size,
+            data_page_row_count_limit,
+            write_batch_size,
+            dictionary,
+            statistics,
+        )
+        self._writer = _lib.Writer(target, capsule, options)
 
     def write(self, data: ArrowData) -> None:
         """Writes a table, a record batch, or any object with `__arrow_c_stream__` or
@@ -443,6 +499,12 @@ def write_table(
     base: str = "zstd(3)",  # pragma: no mutate
     row_group_size: int | None = None,
     encodings: Mapping[str, str] | None = None,
+    *,
+    data_page_size: int | None = None,
+    data_page_row_count_limit: int | None = None,
+    write_batch_size: int | None = None,
+    dictionary: bool | Sequence[str] | None = None,
+    statistics: Statistics | None = None,
 ) -> dict[str, str]:
     """Writes Arrow data to a Parquet file with PCODEC where the policy selects it.
 
@@ -452,7 +514,19 @@ def write_table(
     """
     first, second = _capsules(data)
     target = _sink(sink)
-    options = _options(policy, columns, level, base, row_group_size, encodings)
+    options = _options(
+        policy,
+        columns,
+        level,
+        base,
+        row_group_size,
+        encodings,
+        data_page_size,
+        data_page_row_count_limit,
+        write_batch_size,
+        dictionary,
+        statistics,
+    )
     if second is None:
         return _lib.write_stream(target, first, options)
     writer = _lib.Writer(target, first, options)

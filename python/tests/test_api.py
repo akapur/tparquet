@@ -6,7 +6,7 @@ from __future__ import annotations
 import io
 import os
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -131,6 +131,160 @@ def test_bad_write_options(tmp_path: pathlib.Path, numbers: pa.Table, kwargs: di
     with pytest.raises(ppc.PcodecError, match=message) as e:
         ppc.write_table(numbers, tmp_path / "x.parquet", **kwargs)  # type: ignore[arg-type]
     assert isinstance(e.value, ValueError)
+
+
+def data_pages(path: pathlib.Path) -> dict[str, int]:
+    return {
+        c["path"]: c["pages"].get("DATA_PAGE", 0) + c["pages"].get("DATA_PAGE_V2", 0)
+        for c in ppc.inspect(path)["columns"]
+    }
+
+
+def dictionary_columns(path: pathlib.Path) -> set[str]:
+    return {c["path"] for c in ppc.inspect(path)["columns"] if "DICTIONARY_PAGE" in c["pages"]}
+
+
+@pytest.mark.parametrize("policy", ["pcodec", "base"])
+def test_data_page_limits(tmp_path: pathlib.Path, numbers: pa.Table, policy: ppc.Policy) -> None:
+    table = numbers.append_column("nulls", pa.array([None if i % 10 == 0 else i for i in range(2000)], pa.int64()))
+
+    def pages(**kwargs: Any) -> dict[str, int]:
+        path = tmp_path / "p.parquet"
+        ppc.write_table(table, path, policy=policy, dictionary=False, **kwargs)
+        assert ppc.read_table(path).equals(table)
+        return data_pages(path)
+
+    assert set(pages().values()) == set(pages(write_batch_size=100).values()) == {1}
+    assert set(pages(data_page_row_count_limit=100, write_batch_size=100).values()) == {20}
+    # with nulls, the row count limit is checked once per write batch, of 1024 rows by default
+    assert pages(data_page_row_count_limit=100) == {**dict.fromkeys(numbers.column_names, 20), "nulls": 2}
+    by_size = pages(data_page_size=2000)
+    assert by_size["i64"] == by_size["f64"] == 8
+    assert by_size["i32"] == by_size["f32"] == 4
+
+
+def test_dictionary(tmp_path: pathlib.Path, numbers: pa.Table) -> None:
+    def dictionaries(**kwargs: Any) -> set[str]:
+        path = tmp_path / "d.parquet"
+        ppc.write_table(numbers, path, **kwargs)
+        assert ppc.read_table(path).equals(numbers)
+        return dictionary_columns(path)
+
+    every = {"i32", "i64", "f32", "f64", "s"}
+    assert dictionaries(policy="base") == dictionaries(policy="base", dictionary=True) == every
+    assert dictionaries(policy="base", dictionary=False) == set()
+    assert dictionaries(policy="base", dictionary=["s", "f64"]) == {"s", "f64"}
+    assert dictionaries(policy="base", dictionary=("i32",)) == {"i32"}
+    # PCODEC columns never have a dictionary
+    assert dictionaries(policy="pcodec", dictionary=True) == {"s"}
+    assert dictionaries(policy="pcodec", columns={"i32": "base"}, dictionary=["i32", "i64"]) == {"i32"}
+    # neither have the columns with an encoding
+    assert dictionaries(policy="base", encodings={"f64": "BYTE_STREAM_SPLIT"}) == every - {"f64"}
+
+
+def test_dictionary_of_nested_columns(tmp_path: pathlib.Path) -> None:
+    n = 100
+    inner = pa.StructArray.from_arrays(
+        [pa.array([i % 3 for i in range(n)], pa.int64()), pa.array([f"v{i % 3}" for i in range(n)])], names=["x", "y"]
+    )
+    table = pa.table({"p": inner, "q": pa.array([f"w{i % 4}" for i in range(n)])})
+    path = tmp_path / "n.parquet"
+    for dictionary, expected in [(["p.y"], {"p.y"}), (["p"], {"p.x", "p.y"}), (["q"], {"q"})]:
+        ppc.write_table(table, path, policy="base", dictionary=dictionary)
+        assert dictionary_columns(path) == expected, dictionary
+        assert ppc.read_table(path).equals(table)
+
+
+@pytest.mark.parametrize("policy", ["pcodec", "base"])
+def test_statistics(tmp_path: pathlib.Path, numbers: pa.Table, policy: ppc.Policy) -> None:
+    def chunks(**kwargs: Any) -> set[tuple[bool, bool, bool]]:
+        path = tmp_path / "s.parquet"
+        ppc.write_table(numbers, path, policy=policy, **kwargs)
+        assert ppc.read_table(path).equals(numbers)
+        rg = pq.read_metadata(path).row_group(0)
+        return {
+            (rg.column(i).is_stats_set, rg.column(i).has_column_index, rg.column(i).has_offset_index)
+            for i in range(rg.num_columns)
+        }
+
+    assert chunks() == chunks(statistics="page") == {(True, True, True)}
+    assert chunks(statistics="chunk") == {(True, False, True)}
+    assert chunks(statistics="none") == {(False, False, True)}
+
+
+def test_the_integrations_pass_the_page_options(tmp_path: pathlib.Path, numbers: pa.Table) -> None:
+    import polars as pl
+
+    import tparquet.pandas as ppd
+    import tparquet.polars as ppl
+
+    options: dict[str, Any] = {
+        "policy": "base",
+        "data_page_row_count_limit": 500,
+        "write_batch_size": 500,
+        "dictionary": ["s"],
+        "statistics": "chunk",
+    }
+    # with nulls, a page ends at the row count limit only when the write batches are that small
+    table = numbers.append_column("nulls", pa.array([None if i % 10 == 0 else f"n{i}" for i in range(2000)]))
+    outs = [tmp_path / f"{n}.parquet" for n in ("core", "writer", "pandas", "polars")]
+    ppc.write_table(table, outs[0], **options)
+    with ppc.Writer(outs[1], table.schema, **options) as w:
+        w.write(table)
+    ppd.to_parquet(table.to_pandas(), outs[2], index=False, **options)
+    ppl.write_parquet(pl.DataFrame(table), outs[3], **options)
+    for out in outs:
+        assert set(data_pages(out).values()) == {4}, out
+        assert dictionary_columns(out) == {"s"}, out
+        rg = pq.read_metadata(out).row_group(0)
+        assert {(rg.column(i).is_stats_set, rg.column(i).has_column_index) for i in range(6)} == {(True, False)}
+    small: dict[str, Any] = {"policy": "base", "dictionary": False, "data_page_size": 2000, "write_batch_size": 50}
+    ppl.write_parquet(pl.DataFrame(numbers), outs[3], **small)
+    ppd.to_parquet(numbers.to_pandas(), outs[2], index=False, **small)
+    for out in outs[2:]:
+        assert data_pages(out)["i64"] == 8, out
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"data_page_size": 0}, r"^data_page_size must be positive, got 0$"),
+        ({"data_page_row_count_limit": 0}, r"^data_page_row_count_limit must be positive, got 0$"),
+        ({"write_batch_size": -1}, r"^write_batch_size must be positive, got -1$"),
+        ({"dictionary": ["nope"]}, r'^no column named "nope"$'),
+        ({"statistics": "pages"}, r'^unknown statistics level "pages": expected "none", "chunk" or "page"$'),
+        (
+            {"dictionary": ["f64"], "encodings": {"f64": "BYTE_STREAM_SPLIT"}},
+            r"^the column f64 has an encoding: it is written without a dictionary$",
+        ),
+    ],
+)
+def test_bad_page_options(tmp_path: pathlib.Path, numbers: pa.Table, kwargs: dict[str, Any], message: str) -> None:
+    path = tmp_path / "x.parquet"
+    with pytest.raises(ppc.PcodecError, match=message) as e:
+        ppc.write_table(numbers, path, policy="base", **kwargs)
+    assert isinstance(e.value, ValueError)
+    assert not path.exists()
+    with pytest.raises(ppc.PcodecError, match=message):
+        ppc.Writer(io.BytesIO(), numbers.schema, policy="base", **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"data_page_size": 1.5}, r"^data_page_size must be an int, got float$"),
+        ({"data_page_row_count_limit": True}, r"^data_page_row_count_limit must be an int, got bool$"),
+        ({"write_batch_size": "8"}, r"^write_batch_size must be an int, got str$"),
+        ({"dictionary": "s"}, r"^dictionary must be a bool or a sequence of names, not a str$"),
+        ({"dictionary": b"s"}, r"^dictionary must be a bool or a sequence of names, not a bytes$"),
+        ({"dictionary": 1}, r"^dictionary must be a bool or a sequence of names, not a int$"),
+        ({"dictionary": ["s", 1]}, r"^dictionary names must be str, got int$"),
+        ({"statistics": True}, r"^statistics must be a str, got bool$"),
+    ],
+)
+def test_page_options_of_the_wrong_type(numbers: pa.Table, kwargs: dict[str, Any], message: str) -> None:
+    with pytest.raises(TypeError, match=message):
+        ppc.write_table(numbers, io.BytesIO(), **kwargs)
 
 
 def test_write_rejects_non_arrow(tmp_path: pathlib.Path) -> None:
@@ -635,6 +789,11 @@ def test_public_defaults() -> None:
         "base": "zstd(3)",
         "row_group_size": None,
         "encodings": None,
+        "data_page_size": None,
+        "data_page_row_count_limit": None,
+        "write_batch_size": None,
+        "dictionary": None,
+        "statistics": None,
     }
     assert defaults(ppc.write_table) == write
     assert defaults(ppc.Writer) == write

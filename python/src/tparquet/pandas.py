@@ -15,7 +15,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from tparquet._core import ParquetFile, Policy, Sink, Source, _names, write_table
+from tparquet._core import ParquetFile, Policy, Sink, Source, Statistics, _names, write_table
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -120,6 +120,11 @@ def to_parquet(
     base: str = "zstd(3)",  # pragma: no mutate
     row_group_size: int | None = None,
     encodings: Mapping[str, str] | None = None,
+    data_page_size: int | None = None,
+    data_page_row_count_limit: int | None = None,
+    write_batch_size: int | None = None,
+    dictionary: bool | Sequence[str] | None = None,
+    statistics: Statistics | None = None,
 ) -> dict[str, str]:
     """Writes a DataFrame as a Parquet file with PCODEC where the policy selects it.
 
@@ -139,4 +144,9 @@ def to_parquet(
         base=base,
         row_group_size=row_group_size,
         encodings=encodings,
+        data_page_size=data_page_size,
+        data_page_row_count_limit=data_page_row_count_limit,
+        write_batch_size=write_batch_size,
+        dictionary=dictionary,
+        statistics=statistics,
     )
