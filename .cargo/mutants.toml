@@ -17,6 +17,18 @@ exclude_re = [
     # nothing Java can observe (equivalent mutants).
     'rust/jni/src/lib\.rs:.*delete - in Java_io_aperiodic_tparquet_Pcodec_mode0',
     'rust/jni/src/lib\.rs:.*delete - in Java_io_aperiodic_tparquet_NativeTestHooks_panic0',
+    # Python reader. A read of a local file is not interrupted by a signal: no test can make
+    # `read_at` fail with EINTR, so returning that error instead of retrying is not observable.
+    'python/rust/file\.rs:.*replace match guard .*Interrupted with false in read_exact_at',
+    # The push decoder never asks for an empty byte range (it drops them, see `needed_ranges`)
+    # nor one that ends before it starts (column chunk lengths are not negative), so `<` vs `<=`
+    # or `==` in the check of the ranges it asks for changes nothing (equivalent mutants).
+    'python/rust/file\.rs:.*replace < with (<=|==) in Reader::fetch',
+    # Fast paths: a decoder batch of exactly `batch_size` rows, or a batch taken from one
+    # decoder batch, is otherwise returned through `pending` and `concat_parts`, with the same
+    # rows (equivalent mutants).
+    'python/rust/file\.rs:.*replace match guard self\.pending\.is_empty\(\) && .* with false in Decoded::next_batch',
+    'python/rust/file\.rs:.*delete match arm \[one\] in Decoded::take_pending',
 ]
 # the vendored upstream crate is tested upstream; its patched functions are listed in
 # rust/parquet/FORK.md and mutated by `make fork-mutants`
