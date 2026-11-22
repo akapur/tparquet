@@ -6,6 +6,7 @@ A release publishes, from [`.github/workflows/release.yml`](.github/workflows/re
 |---|---|---|
 | crates.io | `tparquet-core` | `rust/core` |
 | crates.io | `tparquet-parquet` | `rust/parquet`, the arrow-rs `parquet` fork ([`FORK.md`](rust/parquet/FORK.md)) |
+| crates.io | `tparquet-parquet` 59.3.2 | `datafusion/parquet`, the 59.x fork ([`FORK.md`](datafusion/parquet/FORK.md)), renamed on a copy by `scripts/package-parquet-59.sh` |
 | crates.io | `tparquet` | `rust/tparquet`: the library and the `tparquet` CLI |
 | PyPI | `tparquet` | `python/`: abi3 wheels for CPython 3.10+ on Linux x86_64 and aarch64, macOS arm64 and x86_64, Windows x64, and the sdist |
 | PyPI | `polars-tparquet` | `polars-tparquet/` |
@@ -40,7 +41,10 @@ approval before anything is uploaded.
    if its version left their range, then `cargo update --workspace`.
 2. `tparquet-parquet` keeps upstream's version (60.1.0). If the fork changed since its last
    release, give it a new version first ([`FORK.md`](rust/parquet/FORK.md) says how), since a
-   published version cannot be replaced.
+   published version cannot be replaced. The same holds for the 59.x fork in
+   `datafusion/parquet`, published as `tparquet-parquet` 59.3.2: a change to it after its
+   release needs a new version (59.3.3), in `datafusion/parquet/Cargo.toml` and in
+   `scripts/package-parquet-59.sh`, `check-publish.sh` and `publish-crates.sh`.
 3. Check:
 
    ```bash
@@ -53,7 +57,7 @@ approval before anything is uploaded.
 4. Merge the version change to `main`.
 5. For a release that changes the build (and before the first one), run the workflow by hand:
    Actions, release, Run workflow, on `main`. It builds and checks everything, every wheel on its
-   own platform included, and publishes nothing.
+   own platform included, and publishes nothing (unless you tick *publish-crates*).
 6. Tag the commit on `main` and push the tag:
 
    ```bash
@@ -70,6 +74,15 @@ approval before anything is uploaded.
 A version that crates.io or PyPI already has is skipped, so a release that failed half-way can
 be run again (Actions, the failed run, Re-run failed jobs). A published version can be yanked
 (`cargo yank`, PyPI's project settings) but never replaced: fix forward with a new version.
+
+## A crate without a tag
+
+A crate whose version is not the packages' (`tparquet-parquet` 59.3.2, or a new version of a
+fork) is published without a release: Actions, release, Run workflow, on `main`, with
+*publish-crates* ticked. After the checks and the build, the `crates-io` job (in the `release`
+environment, so it waits for its approval) publishes every crate whose version crates.io does
+not have, and nothing to PyPI. Only run it when `main`'s packages hold no unreleased version bump,
+since that would go to crates.io too, without its tag.
 
 ## After the first release
 
