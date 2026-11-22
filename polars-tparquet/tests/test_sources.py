@@ -296,6 +296,7 @@ def test_a_text_mode_file_is_refused_with_a_type_error(write: Write) -> None:
         pt.scan_tparquet(text)  # type: ignore[arg-type]
 
 
+@pytest.mark.usefixtures("non_utf_8_names")
 def test_a_file_name_that_is_not_utf_8(write: Write, tmp_path: pathlib.Path) -> None:
     data = write("a.parquet", ticks(3)).read_bytes()
     raw = os.fsencode(tmp_path / "d") + b"/caf\xe9.parquet"
