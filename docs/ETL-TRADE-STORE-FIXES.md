@@ -39,61 +39,44 @@ only if the forked pyarrow falls short of the targets.
 
 ## Work, in order
 
-1. **Land the benchmarked branches on the fork's `main`.** The bench wheel was built from the
-   local, unpushed `bench-integration-2026-11-16` (HEAD `50be452a`), merging
-   `python-parallel-decode`, `python-coalesced-reads`, `python-string-stats` and
-   `python-writer-options`. The writer and the `tparquet` Python package still come from here.
-2. **Build the Arrow C++ fork on rey** (`cpp/arrow/prepare.sh`, `deps.sh`, `build.sh release`,
-   see `cpp/arrow/FORK.md`). The build needs `libtparquet_capi.a` from `rust/capi`.
-3. **Build pyarrow 26.0.1 against it.** From `target/cpp/arrow-src/python` with
-   `ARROW_HOME`/`CMAKE_PREFIX_PATH` pointing at the fork's install, `PYARROW_WITH_PARQUET=1`
-   (and `PYARROW_WITH_DATASET=1`; the fork build must then include Arrow's dataset/acero
-   components, so extend `build.sh` if they are off). Build it as a wheel that bundles the
-   fork's `libarrow`/`libparquet` (`PYARROW_BUNDLE_ARROW_CPP=1`) so it installs without
-   `LD_LIBRARY_PATH`. Build for **CPython 3.14** (ETL requires `>=3.14.3`); the bench venv is
-   3.13, so build both or move the bench to 3.14. Add a make target and a script that
-   reproduces the wheel, and a smoke test that `pyarrow.parquet.read_table` on a PCODEC file
-   equals `tparquet.read_table` (canonical JSON).
-4. **Decide distribution.** The wheel must install on rey and the other hosts (obiwan, yoda):
-   one manylinux-style build hosted somewhere uv can reach (a local index or a `find-links`
-   directory), pinned by hash in ETL. Write the rebuild recipe for an Arrow version bump.
-5. **Bench C++ and the forked pyarrow** on T256k and TS256k with the ETL harness (see
-   *Benchmark data*): the `pa`, `pa_nopb`, `pa_coal` and `pa_mem` readers become valid for
-   the tparquet formats once pyarrow reads PCODEC (`TPQ_FMTS` and `readers_for` in
-   `readbench.py`). Add a small C++ reader (`tparquet::ReadTable` and
-   `parquet::arrow::FileReader` with a row-group filter for tickers) with the same queries and
-   timings, to confirm C++ matches pyarrow.
-6. **Python-side fixes kept regardless** (cheap, and in code that ships):
-   - **Polars per-batch filter spin (~20 lines).** `tparquet/polars.py` `_source` (~L282-288)
-     runs `pl.DataFrame(batch).filter(predicate)` per 64K-row batch; Polars spreads each tiny
-     filter over 64 threads and the workers spin: 68 batches cost 1.79 s CPU at 64 threads,
-     0.012 s at 1. Fix: mask on the predicate columns only, skip batches with no match, filter
-     the rest once. Readers must filter (`polars/io/plugins.py:92`), so don't yield unfiltered.
-     Prototype: CPU 2.27 s → 0.74–0.89 s.
-   - **The memory bug below.**
+Planned 2026-11-22 in two plans, executed in order:
 
-## Bug: unbounded memory growth in coalesced reads (and an uncapped mutants run)
+1. `docs/plans/2026-11-22-P1-arrow-fork-pyarrow.md`: the fork built with the components pyarrow
+   needs (jemalloc, as stock pyarrow), pyarrow's Cython taught PCODEC (part of `FORK.patch`),
+   a pyarrow 26.0.1+tparquet.1 wheel for CPython 3.14 built on rey (`make -C cpp pyarrow
+   PYTHON=...`), and the C++ query tool `bench/trade-store/cpp/tpq_query` (a thin CLI over
+   `arrow::dataset`).
+2. `docs/plans/2026-11-22-P2-trade-store-gate.md`: the ETL harness moved into
+   `bench/trade-store/`, gate files regenerated from the Massive CSVs through a snapshot of
+   ETL's transform, writer parity against the tparquet Rust writer, a three-way correctness
+   check (Massive → transform = stock pyarrow on Z256k = forked pyarrow = C++), the cold HDD
+   run at 4M with a diagnosis of every reader, and a PASS/FAIL report. It stops there.
 
-`Decoded::take_pending` (`python/rust/file.rs:276`, branch `python-coalesced-reads`). Under
-`cargo mutants`, the `front.num_rows() > needed` → `>=` mutant grows memory at ~7 GB/min in
-`test_conformance`; cargo-mutants' auto timeout (~745 s) lets it reach tens of GB. Three
-uncapped `-j 8` mutants runs are the likely cause of an OOM crash on rey (2026-11-16).
+Settled with the user on 2026-11-22:
 
-Mechanism: with `>=`, an exactly-consumed batch is pushed back as a zero-row slice. Each slice
-holds the parent batch's buffers alive, `pending` keeps accumulating them, and nothing bounds
-`pending` or checks `pending_rows` against its contents. The shipped comparison does not leak
-as far as we know, but the code's memory safety rests on one comparison with no guard.
-
-Fix:
-- Never push empty slices back; drop zero-row batches on entry to `pending`.
-- Assert `pending_rows == sum(pending[i].num_rows())` (debug) and bound `pending` (never more
-  than about one decoder batch beyond `batch_size`).
-- Add a test that streams a large file and checks peak RSS stays bounded.
-- Cap each mutant in `make python-mutants`: run the Python suite through a memory-capped
-  wrapper (pattern: `~/tmp/tparq-wheels/py12g.sh`, `membound 12G`), `--timeout 400`, `-j 2`,
-  and wrap the whole run in `membound 48G`. Raise the missing cap upstream.
+- The benchmarked branches are already on `main` (`dd3e2d3`, `b1367d1`).
+- **One engine, Arrow C++, for reading and writing**, from C++ and Python; pyarrow is the thin
+  Python wrapper. Rust remains only inside the codec. The tparquet Python reader and writer are
+  not ETL dependencies; the reader is dropped if the gate passes. Codecs are a fixed per-column
+  map (from the Rust writer's auto choice on the same data); a per-column codec benchmark comes
+  later.
+- **No portable wheel.** Build on rey for the newest CPython 3.14 and rebuild for new releases;
+  obiwan and yoda (Ubuntu 24.04, glibc 2.39) get it after their move to 26.04. How ETL pins it
+  is ETL's decision when it adopts the wheel (per-host builds and hash pins conflict).
+- **Spinpool only, recordsize 4M**; NVMe is not measured. A recordsize sweep comes later.
+- **Targets are relative to the same run** (stock pyarrow on Z256k, interleaved), not the
+  absolute numbers below.
+- The coalesced-reads guard, the polars filter-spin fix and the capped `make python-mutants`
+  are **deferred**: they matter only if the gate fails and the Rust reader comes back. If
+  that happens, the `take_pending` fix restructures the split (`needed.min(front.num_rows())`,
+  push back only a non-empty remainder) so no equivalent mutant survives, asserts the
+  `pending_rows` invariant, and tests it deterministically with a small RSS backstop; mutants
+  run under `membound` (12G per mutant, 48G per run, `--timeout 400`, `-j 2`).
+- Stock pyarrow **aborts the process** on a PCODEC file (`Unsupported compression codec value:
+  20547`); ETL checks `pa.Codec.is_available("pcodec")` at startup.
 
 ## Deferred: tparquet Rust reader fixes (only if the forked pyarrow misses the targets)
+
 
 Line references are on `bench-integration-2026-11-16`.
 
@@ -117,6 +100,27 @@ Also open, whichever reader: **TS256k full reads are 2.4× slower than T256k** o
 reader (4.04 s vs 1.72 s) with the same CPU, bytes and row-group count. Hypothesis: uneven
 ticker-snapped row groups serialise a row-group-parallel reader. Arrow C++ decodes columns in
 parallel, so check whether the forked pyarrow still shows it.
+
+## Deferred bug: unbounded memory growth in coalesced reads (and an uncapped mutants run)
+
+`Decoded::take_pending` (`python/rust/file.rs:276`, branch `python-coalesced-reads`). Under
+`cargo mutants`, the `front.num_rows() > needed` → `>=` mutant grows memory at ~7 GB/min in
+`test_conformance`; cargo-mutants' auto timeout (~745 s) lets it reach tens of GB. Three
+uncapped `-j 8` mutants runs are the likely cause of an OOM crash on rey (2026-11-16).
+
+Mechanism: with `>=`, an exactly-consumed batch is pushed back as a zero-row slice. Each slice
+holds the parent batch's buffers alive, `pending` keeps accumulating them, and nothing bounds
+`pending` or checks `pending_rows` against its contents. The shipped comparison does not leak
+as far as we know, but the code's memory safety rests on one comparison with no guard.
+
+Fix:
+- Never push empty slices back; drop zero-row batches on entry to `pending`.
+- Assert `pending_rows == sum(pending[i].num_rows())` (debug) and bound `pending` (never more
+  than about one decoder batch beyond `batch_size`).
+- Add a test that streams a large file and checks peak RSS stays bounded.
+- Cap each mutant in `make python-mutants`: run the Python suite through a memory-capped
+  wrapper (pattern: `~/tmp/tparq-wheels/py12g.sh`, `membound 12G`), `--timeout 400`, `-j 2`,
+  and wrap the whole run in `membound 48G`. Raise the missing cap upstream.
 
 ## Where the Rust reader loses today (HDD cold, recordsize 4M, 2026-10-26, medians)
 
@@ -155,15 +159,15 @@ a 200 GB cap. Arrow and pyarrow builds are memory-hungry at high `-j`: cap them 
 
 ## Done when
 
-On the 2026-10-26 files, HDD cold at 4M:
+The gate of `docs/plans/2026-11-22-P2-trade-store-gate.md` (D8) passes on 2026-10-26, HDD cold
+at 4M, medians of 5 rounds, every ratio against stock pyarrow on Z256k in the same run:
 
-- forked pyarrow and C++ read PCODEC files with values identical to `tparquet.read_table`;
-- forked pyarrow, T256k: full ≤ 1.1 × Z256k's 1.37 s; tickers10 ≤ Z256k's 0.62 s;
-  cols3 ≤ 1.1 × Z256k's 1.44 s;
-- C++ within 10% of the forked pyarrow on the same queries;
-- TS256k full within 10% of T256k;
-- the forked pyarrow wheel installs on rey, obiwan and yoda from a reproducible build;
-- the polars filter-spin fix, the coalesced-reads guard and its test are in, and
-  `make python-mutants` runs with a per-mutant cap.
+- values identical along Massive CSV → ETL transform → stock pyarrow (Z256k) → forked pyarrow
+  and C++ (T256k, TS256k), every query;
+- the forked pyarrow writer's T256k within 1% of the tparquet Rust writer's size;
+- forked pyarrow on T256k: full ≤ 1.1×, cols3 ≤ 1.1×, tickers10 ≤ 1.0× Z256k;
+- TS256k full ≤ 1.1× T256k;
+- pyarrow within 10% of the C++ tool on the same queries (Python overhead);
+- the wheel rebuilds on rey from `make -C cpp pyarrow PYTHON=...`.
 
 Then rerun the ETL bench (Tasks 6c–9) with the forked pyarrow as the tparquet reader.
