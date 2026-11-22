@@ -898,6 +898,7 @@ def test_text_mode_files_are_refused_with_a_type_error(tmp_path: pathlib.Path, n
         ppc.Writer(text, numbers.schema)  # type: ignore[arg-type]
 
 
+@pytest.mark.usefixtures("non_utf_8_names")
 def test_paths_that_are_not_utf_8(tmp_path: pathlib.Path, numbers: pa.Table) -> None:
     raw = os.fsencode(tmp_path) + b"/caf\xe9.parquet"
     for sink in (raw, os.fsdecode(raw)):

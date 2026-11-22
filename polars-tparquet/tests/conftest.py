@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import os
 import pathlib
@@ -25,6 +26,24 @@ settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "default"))
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 TESTDATA = pathlib.Path(os.environ.get("TPARQUET_TESTDATA", REPO / "testdata"))
+
+
+@pytest.fixture
+def non_utf_8_names(tmp_path: pathlib.Path) -> None:
+    """Skip the test when the filesystem refuses file names that are not UTF-8.
+
+    ZFS with `utf8only=on` (and some other filesystems) fail such names with EILSEQ.
+    """
+    probe = os.fsencode(tmp_path) + b"/probe\xff"
+    try:
+        open(probe, "wb").close()
+    except OSError as e:
+        if e.errno == errno.EILSEQ:
+            pytest.skip("the filesystem refuses file names that are not UTF-8")
+        raise
+    os.remove(probe)
+
+
 VECTORS = sorted((TESTDATA / "files").glob("*.parquet"))
 
 
