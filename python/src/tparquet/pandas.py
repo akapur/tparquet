@@ -15,7 +15,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from tparquet._core import ParquetFile, Policy, Sink, Source, _names, write_table
+from tparquet._core import ParquetFile, Policy, Sink, Source, Statistics, _names, write_table
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -91,19 +91,21 @@ def _index_columns(schema: pa.Schema) -> list[str]:
     return [c for c in metadata.get("index_columns", []) if isinstance(c, str)]
 
 
-def read_parquet(source: Source, columns: Sequence[str] | None = None, **to_pandas_kwargs: Any) -> pd.DataFrame:
+def read_parquet(
+    source: Source, columns: Sequence[str] | None = None, *, threads: int | None = None, **to_pandas_kwargs: Any
+) -> pd.DataFrame:
     """Reads a Parquet file (PCODEC or not) as a DataFrame, restoring the index and dtypes
     from the pandas metadata.
 
     `columns` selects data columns; the index columns are read too, as `pandas.read_parquet`
-    does. The keyword arguments go to `pyarrow.Table.to_pandas` (`types_mapper`,
-    `categories`...).
+    does. Up to `threads` row groups are decoded at once (by default one per CPU). The other
+    keyword arguments go to `pyarrow.Table.to_pandas` (`types_mapper`, `categories`...).
     """
     f = ParquetFile(source)
     wanted = _names(columns)
     if wanted is not None:
         columns = wanted + [c for c in _index_columns(f.schema) if c not in wanted]
-    return _decode_categories(f.read(columns=columns)).to_pandas(**to_pandas_kwargs)
+    return _decode_categories(f.read(columns=columns, threads=threads)).to_pandas(**to_pandas_kwargs)
 
 
 def to_parquet(
@@ -118,6 +120,11 @@ def to_parquet(
     base: str = "zstd(3)",  # pragma: no mutate
     row_group_size: int | None = None,
     encodings: Mapping[str, str] | None = None,
+    data_page_size: int | None = None,
+    data_page_row_count_limit: int | None = None,
+    write_batch_size: int | None = None,
+    dictionary: bool | Sequence[str] | None = None,
+    statistics: Statistics | None = None,
 ) -> dict[str, str]:
     """Writes a DataFrame as a Parquet file with PCODEC where the policy selects it.
 
@@ -137,4 +144,9 @@ def to_parquet(
         base=base,
         row_group_size=row_group_size,
         encodings=encodings,
+        data_page_size=data_page_size,
+        data_page_row_count_limit=data_page_row_count_limit,
+        write_batch_size=write_batch_size,
+        dictionary=dictionary,
+        statistics=statistics,
     )

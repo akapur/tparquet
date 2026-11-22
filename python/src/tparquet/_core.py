@@ -22,6 +22,8 @@ PcodecError = _lib.PcodecError
 
 #: A codec policy for INT32, INT64, FLOAT and DOUBLE columns.
 Policy = Literal["auto", "pcodec", "base"]
+#: The statistics a file holds: none, per column chunk, or also per page (the column index).
+Statistics = Literal["none", "chunk", "page"]
 
 
 class Readable(Protocol):
@@ -133,6 +135,19 @@ def _names(columns: Sequence[str] | None) -> list[str] | None:
     return None if columns is None else list(columns)
 
 
+def _dictionary(dictionary: bool | Sequence[str] | None) -> tuple[bool | None, list[str]]:
+    """The dictionary setting of every column, and the columns that have one regardless."""
+    if dictionary is None or isinstance(dictionary, bool):
+        return dictionary, []
+    if isinstance(dictionary, (str, bytes)) or not hasattr(dictionary, "__iter__"):
+        raise TypeError(f"dictionary must be a bool or a sequence of names, not a {type(dictionary).__name__}")
+    names = list(dictionary)
+    for name in names:
+        if not isinstance(name, str):
+            raise TypeError(f"dictionary names must be str, got {type(name).__name__}")
+    return False, names
+
+
 def _options(
     policy: Policy,
     columns: Mapping[str, Policy] | None,
@@ -140,7 +155,15 @@ def _options(
     base: str,
     row_group_size: int | None,
     encodings: Mapping[str, str] | None = None,
+    data_page_size: int | None = None,
+    data_page_row_count_limit: int | None = None,
+    write_batch_size: int | None = None,
+    dictionary: bool | Sequence[str] | None = None,
+    statistics: Statistics | None = None,
 ) -> dict[str, Any]:
+    if statistics is not None and not isinstance(statistics, str):
+        raise TypeError(f"statistics must be a str, got {type(statistics).__name__}")
+    every, named = _dictionary(dictionary)
     return {
         "encodings": dict(encodings or {}),
         "policy": policy,
@@ -148,6 +171,12 @@ def _options(
         "level": _int("level", level),
         "base": base,
         "row_group_size": _optional_int("row_group_size", row_group_size),
+        "data_page_size": _optional_int("data_page_size", data_page_size),
+        "data_page_row_count_limit": _optional_int("data_page_row_count_limit", data_page_row_count_limit),
+        "write_batch_size": _optional_int("write_batch_size", write_batch_size),
+        "dictionary": every,
+        "dictionary_columns": named,
+        "statistics": statistics,
     }
 
 
@@ -241,10 +270,12 @@ class ParquetFile:
         top-level column `a.b` and the field `b` of a struct `a`)."""
         return self._file.integer_bounds()
 
-    def _column_bounds(self) -> tuple[dict[str, str], list[dict[str, tuple[int, int]]]]:
-        """How each top-level column of signed integers, dates or timestamps is stored
-        (`int`, `date32`, `date64`, `timestamp[<unit>]`), and per row group `{name: (min,
-        max)}` from its statistics: what `tparquet.polars` prunes row groups with."""
+    def _column_bounds(self) -> tuple[dict[str, str], list[dict[str, tuple[int, int] | tuple[str, str]]]]:
+        """How each top-level column of signed integers, dates, timestamps or strings is
+        stored (`int`, `date32`, `date64`, `timestamp[<unit>]`, `string`), and per row group
+        `{name: (min, max)}` from its statistics (`str`s for strings, where the file orders
+        them as UTF-8 bytes and both are valid UTF-8): what `tparquet.polars` prunes row
+        groups with."""
         return self._file.column_bounds()
 
     def stream(
@@ -253,17 +284,21 @@ class ParquetFile:
         row_groups: Sequence[int] | None = None,
         batch_size: int = 65536,
         limit: int | None = None,
+        *,
+        threads: int | None = None,
     ) -> _lib.RecordBatchStream:
         """A one-shot stream of record batches, exposing `__arrow_c_stream__`.
 
         `columns` are top-level names, returned in that order; `row_groups` are read in the
-        order given; `limit` caps the number of rows.
+        order given; `limit` caps the number of rows. Up to `threads` row groups are decoded
+        at once (by default one per CPU); `threads=1` decodes on the thread that reads.
         """
         return self._file.stream(
             _names(columns),
             None if row_groups is None else [_int("row_groups", rg) for rg in row_groups],
             _int("batch_size", batch_size),
             _optional_int("limit", limit),
+            threads=_optional_int("threads", threads),
         )
 
     def iter_batches(
@@ -271,18 +306,25 @@ class ParquetFile:
         batch_size: int = 65536,
         columns: Sequence[str] | None = None,
         row_groups: Sequence[int] | None = None,
+        *,
+        threads: int | None = None,
     ) -> Iterator[pa.RecordBatch]:
         """Yields `pyarrow.RecordBatch` objects of at most `batch_size` rows."""
         pyarrow = _pyarrow()
-        for batch in self.stream(columns, row_groups, batch_size):
+        for batch in self.stream(columns, row_groups, batch_size, threads=threads):
             yield pyarrow.record_batch(batch)
 
     def read(
-        self, columns: Sequence[str] | None = None, row_groups: Sequence[int] | None = None, batch_size: int = 65536
+        self,
+        columns: Sequence[str] | None = None,
+        row_groups: Sequence[int] | None = None,
+        batch_size: int = 65536,
+        *,
+        threads: int | None = None,
     ) -> pa.Table:
         """Reads the file (or the given columns and row groups) as a `pyarrow.Table`."""
         pyarrow = _pyarrow()
-        stream = self.stream(columns, row_groups, batch_size)
+        stream = self.stream(columns, row_groups, batch_size, threads=threads)
         schema = pyarrow.schema(stream)
         table: pa.Table = pyarrow.Table.from_batches([pyarrow.record_batch(b) for b in stream], schema=schema)
         return table
@@ -297,14 +339,17 @@ def read_batches(
     columns: Sequence[str] | None = None,
     row_groups: Sequence[int] | None = None,
     batch_size: int = 65536,
+    *,
+    threads: int | None = None,
 ) -> _lib.RecordBatchStream:
     """Reads a Parquet file (PCODEC or not) as a one-shot Arrow stream.
 
     The result exposes `__arrow_c_stream__` and `__arrow_c_schema__`, so pyarrow
     (`pa.RecordBatchReader.from_stream`), Polars (`pl.DataFrame`), DuckDB and nanoarrow
-    read it without a copy. Batches are decoded as they are pulled, with the GIL released.
+    read it without a copy. Batches are decoded as they are pulled, with the GIL released,
+    up to `threads` row groups at once (see `ParquetFile.stream`).
     """
-    return ParquetFile(source).stream(columns, row_groups, batch_size)
+    return ParquetFile(source).stream(columns, row_groups, batch_size, threads=threads)
 
 
 def read_table(
@@ -312,13 +357,15 @@ def read_table(
     columns: Sequence[str] | None = None,
     row_groups: Sequence[int] | None = None,
     batch_size: int = 65536,
+    *,
+    threads: int | None = None,
 ) -> pa.Table:
     """Reads a Parquet file (PCODEC or not) as a `pyarrow.Table` (pyarrow must be installed).
 
     `columns` are top-level names, in the order wanted; `row_groups` are indices, read in the
     order given.
     """
-    return ParquetFile(source).read(columns, row_groups, batch_size)
+    return ParquetFile(source).read(columns, row_groups, batch_size, threads=threads)
 
 
 def _schema_capsule(schema: ArrowSchemaExportable) -> object:
@@ -342,6 +389,14 @@ class Writer:
     column, named as in `columns`, to the Parquet encoding it is written with when it gets the
     base codec (`"ALP"`, `"BYTE_STREAM_SPLIT"`, `"DELTA_BINARY_PACKED"`...), without a
     dictionary; PCODEC columns are always PLAIN.
+
+    `data_page_size` (bytes before compression) and `data_page_row_count_limit` end a data
+    page; in columns with nulls the row count is checked once per write batch of
+    `write_batch_size` rows (1024 by default), so a lower limit needs smaller batches.
+    `dictionary` turns dictionary encoding on or off for every column, or names the only
+    columns (as in `columns`) that get it; PCODEC columns and columns with an encoding never
+    have one. `statistics` is `"none"`, `"chunk"` or `"page"` (the default, which also writes
+    the column index); the offset index is always written. `None` leaves the writer's default.
     """
 
     def __init__(
@@ -355,10 +410,29 @@ class Writer:
         base: str = "zstd(3)",  # pragma: no mutate
         row_group_size: int | None = None,
         encodings: Mapping[str, str] | None = None,
+        *,
+        data_page_size: int | None = None,
+        data_page_row_count_limit: int | None = None,
+        write_batch_size: int | None = None,
+        dictionary: bool | Sequence[str] | None = None,
+        statistics: Statistics | None = None,
     ) -> None:
         target = _sink(sink)
         capsule = _schema_capsule(schema)
-        self._writer = _lib.Writer(target, capsule, _options(policy, columns, level, base, row_group_size, encodings))
+        options = _options(
+            policy,
+            columns,
+            level,
+            base,
+            row_group_size,
+            encodings,
+            data_page_size,
+            data_page_row_count_limit,
+            write_batch_size,
+            dictionary,
+            statistics,
+        )
+        self._writer = _lib.Writer(target, capsule, options)
 
     def write(self, data: ArrowData) -> None:
         """Writes a table, a record batch, or any object with `__arrow_c_stream__` or
@@ -425,6 +499,12 @@ def write_table(
     base: str = "zstd(3)",  # pragma: no mutate
     row_group_size: int | None = None,
     encodings: Mapping[str, str] | None = None,
+    *,
+    data_page_size: int | None = None,
+    data_page_row_count_limit: int | None = None,
+    write_batch_size: int | None = None,
+    dictionary: bool | Sequence[str] | None = None,
+    statistics: Statistics | None = None,
 ) -> dict[str, str]:
     """Writes Arrow data to a Parquet file with PCODEC where the policy selects it.
 
@@ -434,7 +514,19 @@ def write_table(
     """
     first, second = _capsules(data)
     target = _sink(sink)
-    options = _options(policy, columns, level, base, row_group_size, encodings)
+    options = _options(
+        policy,
+        columns,
+        level,
+        base,
+        row_group_size,
+        encodings,
+        data_page_size,
+        data_page_row_count_limit,
+        write_batch_size,
+        dictionary,
+        statistics,
+    )
     if second is None:
         return _lib.write_stream(target, first, options)
     writer = _lib.Writer(target, first, options)

@@ -25,7 +25,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from typing import Union
 
 import polars as pl
-from tparquet import PcodecError, Policy, Sink, Source, Writer
+from tparquet import PcodecError, Policy, Sink, Source, Statistics, Writer
 from tparquet.polars import scan_parquet, write_parquet
 
 __all__ = ["DataFrameNamespace", "LazyFrameNamespace", "read_tparquet", "scan_tparquet"]
@@ -225,6 +225,11 @@ class DataFrameNamespace:
         # "ZSTD(3)" (a mutant) names the same codec as "zstd(3)": no test can tell them apart
         base: str = "zstd(3)",  # pragma: no mutate
         row_group_size: int | None = None,
+        data_page_size: int | None = None,
+        data_page_row_count_limit: int | None = None,
+        write_batch_size: int | None = None,
+        dictionary: bool | Sequence[str] | None = None,
+        statistics: Statistics | None = None,
     ) -> dict[str, str]:
         """Writes the frame to `target` (a path or a binary file object) and returns the codec of
         every leaf column.
@@ -233,7 +238,8 @@ class DataFrameNamespace:
         base codec is smaller; `"pcodec"` and `"base"` force one. `columns` maps a column name or
         dotted leaf path to its own policy, `level` is the pcodec level (0 to 12), `base` the codec
         of the other columns (`"zstd(3)"`, `"snappy"`, ...) and `row_group_size` the most rows
-        per row group.
+        per row group. The page options (`data_page_size`, `data_page_row_count_limit`,
+        `write_batch_size`, `dictionary`, `statistics`) are those of `tparquet.Writer`.
 
         A path is written as a hidden temporary file beside it, which replaces it once complete:
         if writing fails, the target is left as it was.
@@ -241,7 +247,18 @@ class DataFrameNamespace:
         _writable(self._df.schema)
         with _replacing(target) as sink:
             return write_parquet(
-                self._df, sink, policy=policy, columns=columns, level=level, base=base, row_group_size=row_group_size
+                self._df,
+                sink,
+                policy=policy,
+                columns=columns,
+                level=level,
+                base=base,
+                row_group_size=row_group_size,
+                data_page_size=data_page_size,
+                data_page_row_count_limit=data_page_row_count_limit,
+                write_batch_size=write_batch_size,
+                dictionary=dictionary,
+                statistics=statistics,
             )
 
 
@@ -262,6 +279,11 @@ class LazyFrameNamespace:
         # "ZSTD(3)" (a mutant) names the same codec as "zstd(3)": no test can tell them apart
         base: str = "zstd(3)",  # pragma: no mutate
         row_group_size: int | None = None,
+        data_page_size: int | None = None,
+        data_page_row_count_limit: int | None = None,
+        write_batch_size: int | None = None,
+        dictionary: bool | Sequence[str] | None = None,
+        statistics: Statistics | None = None,
         chunk_size: int | None = None,
     ) -> dict[str, str]:
         """Runs the query and writes its result to `target` batch by batch (`chunk_size` rows,
@@ -279,7 +301,18 @@ class LazyFrameNamespace:
         with (
             _replacing(target) as sink,
             Writer(
-                sink, schema, policy=policy, columns=columns, level=level, base=base, row_group_size=row_group_size
+                sink,
+                schema,
+                policy=policy,
+                columns=columns,
+                level=level,
+                base=base,
+                row_group_size=row_group_size,
+                data_page_size=data_page_size,
+                data_page_row_count_limit=data_page_row_count_limit,
+                write_batch_size=write_batch_size,
+                dictionary=dictionary,
+                statistics=statistics,
             ) as writer,
         ):
             for batch in self._lf.collect_batches(chunk_size=chunk_size):

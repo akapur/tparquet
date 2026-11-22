@@ -476,3 +476,55 @@ fn bad_column_encodings_are_errors() {
         );
     }
 }
+
+fn has_dictionary(e: &[(String, Vec<String>)]) -> Vec<bool> {
+    e.iter().map(|(_, e)| e.contains(&"RLE_DICTIONARY".to_string())).collect()
+}
+
+#[test]
+fn column_dictionaries_override_the_properties() {
+    let batch = mixed(N, 11);
+    let off = WriterProperties::builder().set_dictionary_enabled(false).build();
+    let options = WriterOptions::default()
+        .with_policy(Policy::Base)
+        .with_properties(off)
+        .with_dictionary("flag", true)
+        .with_dictionary("name", true)
+        .with_dictionary("name", false);
+    let (file, _) = write(std::slice::from_ref(&batch), options);
+    assert_eq!(has_dictionary(&encodings(&file)), [false, false, true, false]);
+    assert_eq!(lines(&file), batch_lines(std::slice::from_ref(&batch)));
+    let options = WriterOptions::default().with_policy(Policy::Base).with_dictionary("ts", false);
+    let (file, _) = write(std::slice::from_ref(&batch), options);
+    assert_eq!(has_dictionary(&encodings(&file)), [false, true, true, true]);
+}
+
+#[test]
+fn pcodec_columns_and_columns_with_an_encoding_have_no_dictionary() {
+    use tparquet::parquet::basic::Encoding;
+    let batch = mixed(N, 12);
+    let options = WriterOptions::default()
+        .with_policy(Policy::Pcodec)
+        .with_column("flag", Policy::Base)
+        .with_dictionary("ts", true)
+        .with_dictionary("flag", true)
+        .with_encoding("name", Encoding::DELTA_BYTE_ARRAY)
+        .with_dictionary("name", false);
+    let (file, _) = write(std::slice::from_ref(&batch), options);
+    assert_eq!(has_dictionary(&encodings(&file)), [false, false, true, false]);
+    assert_eq!(lines(&file), batch_lines(&[batch]));
+}
+
+#[test]
+fn bad_column_dictionaries_are_errors() {
+    use tparquet::parquet::basic::Encoding;
+    let schema = mixed(1, 0).schema();
+    let error = |o: WriterOptions| Writer::try_new(Vec::new(), schema.clone(), o).err().unwrap().to_string();
+    assert_eq!(error(WriterOptions::default().with_dictionary("nope", true)), "no column named \"nope\"");
+    assert_eq!(
+        error(
+            WriterOptions::default().with_encoding("price", Encoding::BYTE_STREAM_SPLIT).with_dictionary("price", true)
+        ),
+        "the column price has an encoding: it is written without a dictionary"
+    );
+}

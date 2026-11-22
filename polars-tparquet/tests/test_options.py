@@ -55,6 +55,12 @@ BAD: list[tuple[dict[str, Any], type[Exception], str | None]] = [
     ({"columns": {"ts.x": "pcodec"}}, tparquet.PcodecError, r'^no column named "ts\.x"$'),
     ({"row_group_size": 0}, tparquet.PcodecError, r"^row_group_size must be positive, got 0$"),
     ({"row_group_size": -5}, tparquet.PcodecError, r"^row_group_size must be positive, got -5$"),
+    ({"data_page_size": 0}, tparquet.PcodecError, r"^data_page_size must be positive, got 0$"),
+    ({"data_page_row_count_limit": 0}, tparquet.PcodecError, r"^data_page_row_count_limit must be positive, got 0$"),
+    ({"write_batch_size": 0}, tparquet.PcodecError, r"^write_batch_size must be positive, got 0$"),
+    ({"dictionary": ["nope"]}, tparquet.PcodecError, r'^no column named "nope"$'),
+    ({"dictionary": "sym"}, TypeError, r"^dictionary must be a bool or a sequence of names, not a str$"),
+    ({"statistics": "all"}, tparquet.PcodecError, r'^unknown statistics level "all"'),
 ]
 
 
@@ -176,6 +182,25 @@ def test_row_group_size(writes: Writes, rows: int, size: int, groups: int) -> No
     assert meta.num_row_groups == groups
     assert max(meta.row_group_rows) == min(size, rows)
     assert_frame_equal(pt.read_tparquet(io.BytesIO(buf.getvalue())), ticks(rows))
+
+
+def test_page_options(writes: Writes) -> None:
+    buf = io.BytesIO()
+    options: dict[str, Any] = {"data_page_row_count_limit": 100, "write_batch_size": 100, "statistics": "none"}
+    writes(ticks(1000), buf, policy="base", dictionary=["sym"], **options)
+    report = tparquet.inspect(io.BytesIO(buf.getvalue()))["columns"]
+    assert {c["path"]: c["pages"] for c in report} == {
+        "ts": {"DATA_PAGE": 10},
+        "price": {"DATA_PAGE": 10},
+        "qty": {"DATA_PAGE": 10},
+        "sym": {"DATA_PAGE": 10, "DICTIONARY_PAGE": 1},
+    }
+    assert tparquet.ParquetFile(io.BytesIO(buf.getvalue())).integer_bounds() == [{}]
+    assert_frame_equal(pt.read_tparquet(io.BytesIO(buf.getvalue())), ticks(1000))
+    buf = io.BytesIO()
+    writes(ticks(1000), buf, policy="pcodec", data_page_size=1000, dictionary=True)
+    report = tparquet.inspect(io.BytesIO(buf.getvalue()))["columns"]
+    assert {c["path"]: c["pages"] for c in report}["ts"] == {"DATA_PAGE_V2": 8}
 
 
 def test_options_are_keywords(tmp_path: pathlib.Path) -> None:

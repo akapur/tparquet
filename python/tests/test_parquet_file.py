@@ -180,6 +180,20 @@ def test_read_matches_pyarrow(tmp_path: pathlib.Path) -> None:
     ]
 
 
+DICTIONARY_INDICES = [pa.int8(), pa.int16(), pa.int32(), pa.int64(), pa.uint8(), pa.uint16(), pa.uint32(), pa.uint64()]
+
+
+@pytest.mark.parametrize("index", DICTIONARY_INDICES, ids=str)
+def test_a_batch_across_row_groups_keeps_their_dictionary(tmp_path: pathlib.Path, index: pa.DataType) -> None:
+    column = pa.array(["abc"[i % 3] for i in range(100)]).dictionary_encode().cast(pa.dictionary(index, pa.string()))
+    path = tmp_path / "dictionary.parquet"
+    # pyarrow writes the column's dictionary into every row group as it is
+    pq.write_table(pa.table({"d": column}), path, row_group_size=10)
+    batch = next(ppc.ParquetFile(path).iter_batches(batch_size=25))
+    # equal dictionary arrays have equal dictionaries, not only equal values
+    assert batch.column(0).equals(column.slice(0, 25))
+
+
 def fds() -> int:
     return len(os.listdir("/proc/self/fd"))
 
@@ -195,6 +209,32 @@ def test_files_are_closed_when_dropped(path: pathlib.Path) -> None:
     del files, streams
     gc.collect()
     assert fds() == before
+
+
+def io_counters() -> tuple[int, int]:
+    """Read syscalls and bytes read by this process so far."""
+    with open("/proc/self/io") as f:
+        fields = dict(line.split(": ") for line in f.read().splitlines())
+    return int(fields["syscr"]), int(fields["rchar"])
+
+
+# Many small pages (20,000 rows each at most), in two row groups of four column chunks.
+MANY_PAGES = pa.table({c: pa.array(range(i, i + 200_000), pa.int64()) for i, c in enumerate("abcd")})
+
+
+@pytest.mark.skipif(not os.path.isfile("/proc/self/io"), reason="needs /proc/self/io")
+@pytest.mark.parametrize("columns", [None, ["b", "d"]])
+def test_a_column_chunk_is_read_at_once(tmp_path: pathlib.Path, columns: list[str] | None) -> None:
+    path = tmp_path / "pages.parquet"
+    ppc.write_table(MANY_PAGES, path, policy="pcodec", row_group_size=100_000)
+    f = ppc.ParquetFile(path)
+    names = columns or MANY_PAGES.column_names
+    calls, read = io_counters()
+    table = rows(f.stream(columns=columns))
+    calls_after, read_after = io_counters()
+    assert table.equals(MANY_PAGES.select(names))
+    assert calls_after - calls <= f.metadata.num_row_groups * len(names)
+    assert read_after - read <= path.stat().st_size
 
 
 def rss() -> int:

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 import polars as pl
 from polars.io.plugins import register_io_source
 
-from tparquet._core import ParquetFile, Policy, Sink, Source, write_table
+from tparquet._core import ParquetFile, Policy, Sink, Source, Statistics, write_table
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -22,12 +22,17 @@ __all__ = ["read_parquet", "scan_parquet", "write_parquet"]
 
 #: Polars dtypes whose values are the stored signed integers the statistics bound.
 _SIGNED = (pl.Int8, pl.Int16, pl.Int32, pl.Int64, pl.Date, pl.Datetime)
+#: Polars dtypes whose values are the strings the statistics bound (in UTF-8 byte order, which
+#: is the code-point order Python compares `str`s in). Categories only compare as strings for
+#: equality.
+_STRINGS = (pl.String, pl.Categorical)
 _UNITS = {"Milliseconds": "ms", "Microseconds": "us", "Nanoseconds": "ns"}
 
 
-def read_parquet(source: Source, columns: Sequence[str] | None = None) -> pl.DataFrame:
-    """Reads a Parquet file (PCODEC or not) as a DataFrame; `columns` in the order given."""
-    df: pl.DataFrame = pl.DataFrame(ParquetFile(source).stream(columns))
+def read_parquet(source: Source, columns: Sequence[str] | None = None, *, threads: int | None = None) -> pl.DataFrame:
+    """Reads a Parquet file (PCODEC or not) as a DataFrame; `columns` in the order given,
+    decoding up to `threads` row groups at once (by default one per CPU)."""
+    df: pl.DataFrame = pl.DataFrame(ParquetFile(source).stream(columns, threads=threads))
     return df
 
 
@@ -42,6 +47,11 @@ def write_parquet(
     base: str = "zstd(3)",  # pragma: no mutate
     row_group_size: int | None = None,
     encodings: Mapping[str, str] | None = None,
+    data_page_size: int | None = None,
+    data_page_row_count_limit: int | None = None,
+    write_batch_size: int | None = None,
+    dictionary: bool | Sequence[str] | None = None,
+    statistics: Statistics | None = None,
 ) -> dict[str, str]:
     """Writes a DataFrame (or the result of a LazyFrame) with PCODEC where the policy selects
     it; the options are those of `tparquet.write_table`. Returns the codec of every
@@ -59,6 +69,11 @@ def write_parquet(
         base=base,
         row_group_size=row_group_size,
         encodings=encodings,
+        data_page_size=data_page_size,
+        data_page_row_count_limit=data_page_row_count_limit,
+        write_batch_size=write_batch_size,
+        dictionary=dictionary,
+        statistics=statistics,
     )
 
 
@@ -71,9 +86,9 @@ def _get(node: Any, *keys: str) -> Any:
     return node
 
 
-def _literal(node: Any, dtype: pl.DataType) -> int | None:
-    """The stored integer of a literal compared with a column of `dtype`, or `None` when the
-    literal is not one this pruner understands exactly."""
+def _literal(node: Any, dtype: pl.DataType) -> int | str | None:
+    """The stored integer or string of a literal compared with a column of `dtype`, or `None`
+    when the literal is not one this pruner understands exactly."""
     lit = _get(node, "Literal")
     if not isinstance(lit, dict):
         return None
@@ -93,6 +108,11 @@ def _literal(node: Any, dtype: pl.DataType) -> int | None:
             return int(value_)
     if kind in {"Int8", "Int16", "Int32", "Int64"} and isinstance(v, int) and dtype.is_integer():
         return v
+    if kind == "String" and isinstance(v, str) and isinstance(dtype, _STRINGS):
+        return v
+    category = _get(v, "value")
+    if kind == "Categorical" and isinstance(category, str) and isinstance(dtype, pl.Categorical):
+        return category
     return None
 
 
@@ -100,7 +120,7 @@ _FLIP = {"Lt": "Gt", "LtEq": "GtEq", "Gt": "Lt", "GtEq": "LtEq", "Eq": "Eq"}
 
 
 #: For each comparison `column <op> v`: whether a value in `lo..=hi` may satisfy it.
-_MAY: dict[str, Callable[[int, int, int], bool]] = {
+_MAY: dict[str, Callable[[Any, Any, Any], bool]] = {
     "Eq": lambda lo, hi, v: lo <= v <= hi,
     "Lt": lambda lo, hi, v: lo < v,
     "LtEq": lambda lo, hi, v: lo <= v,
@@ -108,20 +128,21 @@ _MAY: dict[str, Callable[[int, int, int], bool]] = {
     "GtEq": lambda lo, hi, v: hi >= v,
 }
 
+Bounds = dict[str, tuple[int, int] | tuple[str, str]]
 
-def _compare(name: str, op: str, v: int) -> Callable[[dict[str, tuple[int, int]]], bool]:
+
+def _compare(name: str, op: str, v: int | str) -> Callable[[Bounds], bool]:
     test = _MAY[op]
 
-    def may(bounds: dict[str, tuple[int, int]]) -> bool:
+    def may(bounds: Bounds) -> bool:
         if name not in bounds:
             return True
         lo, hi = bounds[name]
+        if type(lo) is not type(v):
+            return True
         return test(lo, hi, v)
 
     return may
-
-
-Bounds = dict[str, tuple[int, int]]
 
 
 def _both(a: Callable[[Bounds], bool], b: Callable[[Bounds], bool]) -> Callable[[Bounds], bool]:
@@ -132,15 +153,19 @@ def _either(a: Callable[[Bounds], bool], b: Callable[[Bounds], bool]) -> Callabl
     return lambda bounds: a(bounds) or b(bounds)
 
 
-def _column(node: Any, schema: pl.Schema) -> str | None:
-    """The name of a column node of a prunable dtype."""
+def _column(node: Any, schema: pl.Schema, equality: bool = False) -> str | None:
+    """The name of a column node of a dtype a comparison can prune; of a categorical one only
+    for an `equality`."""
     name = _get(node, "Column")
-    if isinstance(name, str) and isinstance(schema.get(name), _SIGNED):
+    if not isinstance(name, str):
+        return None
+    dtype = schema.get(name)
+    if isinstance(dtype, (*_SIGNED, pl.String)) or (equality and isinstance(dtype, pl.Categorical)):
         return name
     return None
 
 
-def _test(node: Any, schema: pl.Schema) -> Callable[[dict[str, tuple[int, int]]], bool] | None:
+def _test(node: Any, schema: pl.Schema) -> Callable[[Bounds], bool] | None:
     """A test of row-group bounds for the predicate `node` (serialized Polars expression),
     or `None` when the predicate is not understood (the row group is then kept)."""
     if not isinstance(node, dict):
@@ -162,11 +187,11 @@ def _test(node: Any, schema: pl.Schema) -> Callable[[dict[str, tuple[int, int]]]
             return _either(a, b)
         if op not in _FLIP:
             return None
-        name = _column(left, schema)
+        name = _column(left, schema, op == "Eq")
         if name is not None:
             v = _literal(right, schema[name])
             return None if v is None else _compare(name, op, v)
-        name = _column(right, schema)
+        name = _column(right, schema, op == "Eq")
         if name is not None:
             v = _literal(left, schema[name])
             return None if v is None else _compare(name, _FLIP[op], v)
@@ -191,8 +216,10 @@ def _test(node: Any, schema: pl.Schema) -> Callable[[dict[str, tuple[int, int]]]
 
 
 def _same_values(dtype: pl.DataType, stored: str) -> bool:
-    """Whether a Polars column of `dtype` holds the integers a column stored as `stored`
-    (`ParquetFile._column_bounds`) has: Polars reads `timestamp[s]` in milliseconds."""
+    """Whether a Polars column of `dtype` holds the integers or strings a column stored as
+    `stored` (`ParquetFile._column_bounds`) has: Polars reads `timestamp[s]` in milliseconds."""
+    if isinstance(dtype, _STRINGS):
+        return stored == "string"
     if isinstance(dtype, pl.Datetime):
         return stored == f"timestamp[{dtype.time_unit}]" or (stored == "date64" and dtype.time_unit == "ms")
     if dtype == pl.Date:
@@ -241,7 +268,7 @@ DEFAULT_BATCH_SIZE = 65536
 
 
 def _source(
-    f: ParquetFile, batch_size: int | None, schema: pl.Schema
+    f: ParquetFile, batch_size: int | None, schema: pl.Schema, threads: int | None = None
 ) -> Callable[[list[str] | None, pl.Expr | None, int | None, int | None], Iterator[pl.DataFrame]]:
     """The IO plugin's generator over `f`, whose Polars schema is `schema`."""
 
@@ -252,7 +279,7 @@ def _source(
         if columns is not None and predicate is not None:
             columns = list(dict.fromkeys([*columns, *predicate.meta.root_names()]))
         row_groups, limit = _plan(f, predicate, schema, n_rows)
-        for batch in f.stream(columns, row_groups, batch_size or hint or DEFAULT_BATCH_SIZE, limit):
+        for batch in f.stream(columns, row_groups, batch_size or hint or DEFAULT_BATCH_SIZE, limit, threads=threads):
             df = pl.DataFrame(batch)
             if predicate is not None:
                 df = df.filter(predicate)
@@ -263,15 +290,18 @@ def _source(
     return source
 
 
-def scan_parquet(source: Source, *, batch_size: int | None = None) -> pl.LazyFrame:
+def scan_parquet(source: Source, *, batch_size: int | None = None, threads: int | None = None) -> pl.LazyFrame:
     """A LazyFrame over a Parquet file (PCODEC or not).
 
     The query's projection, row limit and predicate are pushed to the reader; the predicate
-    is applied with Polars and also skips row groups whose integer, date and datetime
-    statistics rule it out. Batches have `batch_size` rows, else the size the engine asks for.
+    is applied with Polars and also skips row groups whose integer, date, datetime and string
+    statistics rule it out. Batches have `batch_size` rows, else the size the engine asks for;
+    up to `threads` row groups are decoded at once (by default one per CPU).
     """
     if batch_size is not None and batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if threads is not None and threads <= 0:
+        raise ValueError(f"threads must be positive, got {threads}")
     f = ParquetFile(source)
     schema = pl.DataFrame(f.empty()).schema
-    return register_io_source(_source(f, batch_size, schema), schema=schema)
+    return register_io_source(_source(f, batch_size, schema, threads), schema=schema)

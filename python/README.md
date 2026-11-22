@@ -16,7 +16,10 @@ stream = tpq.read_batches("trades.parquet")              # __arrow_c_stream__, f
   `"auto"` (PCODEC or the base codec per column, whichever is smaller on the first batch), `"pcodec"`
   or `"base"`, `columns` maps a column name or dotted leaf path to its own policy, and `encodings`
   maps one to the Parquet encoding of its base-codec pages (`"ALP"`, `"BYTE_STREAM_SPLIT"`,
-  `"DELTA_BINARY_PACKED"`..., no dictionary; PCODEC columns stay PLAIN).
+  `"DELTA_BINARY_PACKED"`..., no dictionary; PCODEC columns stay PLAIN). Keyword-only page options,
+  each `None` for the writer's default: `data_page_size` (bytes), `data_page_row_count_limit`,
+  `write_batch_size`, `dictionary` (`True`, `False`, or the only columns with one; never on PCODEC
+  columns) and `statistics` (`"none"`, `"chunk"`, or `"page"` with the column index).
 - `Writer(path, schema, ...)`: a streaming context manager with the same options.
 - `ParquetFile(path)`: `.schema`, `.metadata`, `.iter_batches()`, `.read()`.
 - `transcode`, `inspect`, `verify`; `tparquet.codec` for the page payload alone.
@@ -24,6 +27,9 @@ stream = tpq.read_batches("trades.parquet")              # __arrow_c_stream__, f
 - `tparquet.polars`: `scan_parquet` (projection, limit, predicate and row-group pruning
   pushed down), `read_parquet`, `write_parquet`.
 - `tparquet.duckdb`: `register`, `sql_view`, `read_parquet`.
+- Every reader takes a keyword `threads`: up to that many row groups are decoded at once, each
+  by a thread of its own (by default one per CPU), and at most that many decoded row groups are
+  held at once; `threads=1` decodes on the thread that reads. The batches are the same either way.
 
 Paths are `str`, `bytes` or `os.PathLike` (names that are not UTF-8 work), or binary file objects
 (a text-mode file is a `TypeError`; a file object to read from is read to its end once). Errors are
