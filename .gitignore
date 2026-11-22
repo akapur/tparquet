@@ -13,3 +13,5 @@ rust/core/fuzz/Cargo.lock
 .claude/worktrees/
 # the benchmark's download cache: the providers' sample files are not ours to redistribute
 bench/data/
+# scratch files the execute-plan role agents write (base copies of files, as tmp/<name>.orig)
+/tmp/
